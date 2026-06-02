@@ -185,7 +185,7 @@ if __name__ == "__main__":
     print("  Section 3 — Tokenizer")
     print(f"{'='*60}\n")
 
-    tok = Tokenizer.from_pretrained("meta-llama/Llama-3.2-3B")
+    tok = Tokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
     tok.print_summary()
 
     # --- round-trip test ---
