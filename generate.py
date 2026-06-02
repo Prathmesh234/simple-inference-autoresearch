@@ -249,7 +249,7 @@ if __name__ == "__main__":
 
     DEVICE   = "cuda"
     DTYPE    = torch.bfloat16
-    MODEL_ID = "meta-llama/Llama-3.2-3B"
+    MODEL_ID = "meta-llama/Llama-3.1-8B"
     PROMPT   = (
         "Question: Design a real-time chat application that can scale to millions of concurrent users.\n"
         "Answer: To design a real-time chat application at scale, we use a microservices architecture with WebSockets for persistent connections, a message broker like Redis Pub/Sub for routing messages, and a NoSQL database like Cassandra for storing message history. The key components are:\n"
@@ -269,8 +269,8 @@ if __name__ == "__main__":
     tok = Tokenizer.from_pretrained(MODEL_ID)
 
     print("Loading model...")
-    cfg    = ModelConfig.llama_3_2_3b()
     loader = WeightLoader.from_pretrained(MODEL_ID)
+    cfg    = ModelConfig.from_hf_config(loader.model_dir / "config.json")
     model  = LlamaModel(cfg, torch.device(DEVICE))
     model.load_weights(loader)
     model.to(DEVICE, DTYPE)

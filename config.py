@@ -20,7 +20,7 @@ import torch
 class RopeScalingConfig:
     """Llama 3 uses a modified RoPE scaling scheme called 'llama3'."""
     rope_type: str                          # "llama3" for Llama 3.x
-    factor: float                           # overall scale factor (32.0)
+    factor: float                           # overall scale factor (8.0)
     low_freq_factor: float                  # frequencies below this get full scaling
     high_freq_factor: float                 # frequencies above this get no scaling
     original_max_position_embeddings: int   # context length the model was pretrained at
@@ -39,13 +39,13 @@ class RopeScalingConfig:
 @dataclass
 class ModelConfig:
     # --- dimensions ---
-    hidden_size: int            # residual stream width (3072)
-    intermediate_size: int      # MLP hidden dim (8192)
-    num_hidden_layers: int      # number of transformer blocks (28)
+    hidden_size: int            # residual stream width (4096)
+    intermediate_size: int      # MLP hidden dim (14336)
+    num_hidden_layers: int      # number of transformer blocks (32)
     vocab_size: int             # token vocabulary size (128256)
 
     # --- attention ---
-    num_attention_heads: int    # Q heads (24)
+    num_attention_heads: int    # Q heads (32)
     num_key_value_heads: int    # KV heads — < Q heads means GQA (8)
 
     # --- normalization ---
@@ -109,28 +109,28 @@ class ModelConfig:
         )
 
     @classmethod
-    def llama_3_2_3b(cls) -> ModelConfig:
-        """Hardcoded config for Llama-3.2-3B — useful before you have the files."""
+    def llama_3_1_8b(cls) -> ModelConfig:
+        """Hardcoded config for Llama-3.1-8B (base). Note: does NOT tie embeddings."""
         return cls(
-            hidden_size=3072,
-            intermediate_size=8192,
-            num_hidden_layers=28,
+            hidden_size=4096,
+            intermediate_size=14336,
+            num_hidden_layers=32,
             vocab_size=128256,
-            num_attention_heads=24,
+            num_attention_heads=32,
             num_key_value_heads=8,
             rms_norm_eps=1e-5,
             rope_theta=500000.0,
             max_position_embeddings=131072,
             rope_scaling=RopeScalingConfig(
                 rope_type="llama3",
-                factor=32.0,
+                factor=8.0,
                 low_freq_factor=1.0,
                 high_freq_factor=4.0,
                 original_max_position_embeddings=8192,
             ),
             bos_token_id=128000,
             eos_token_id=128001,
-            tie_word_embeddings=True,
+            tie_word_embeddings=False,
             torch_dtype="bfloat16",
         )
 
@@ -204,7 +204,7 @@ def verify_gpu():
 if __name__ == "__main__":
     verify_gpu()
     print()
-    cfg = ModelConfig.llama_3_2_3b()
+    cfg = ModelConfig.llama_3_1_8b()
     cfg.print_summary()
 
     # sanity: load from file if it already exists
