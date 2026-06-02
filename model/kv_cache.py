@@ -29,12 +29,12 @@ along dim=3 with zero reshape cost.
 
 Memory
 ------
-Llama 3.2-3B:
-  n_layers=28, n_heads_kv=8, head_dim=128, bf16 (2 bytes)
+Llama-3.1-8B:
+  n_layers=32, n_heads_kv=8, head_dim=128, bf16 (2 bytes)
   per-token-per-layer (K+V) = 2 * 8 * 128 * 2 = 4096 B = 4 KB
-  per-token across all layers = 28 * 4 KB = 112 KB
+  per-token across all layers = 32 * 4 KB = 128 KB
 
-So a single 8k-context request uses ~900 MB; a batch of 8 at 8k ≈ 7 GB.
+So a single 8k-context request uses ~1 GB; a batch of 8 at 8k ≈ 8 GB.
 That's why Phase 3 introduces PagedAttention — this pre-allocation is wasteful.
 
 Position management
@@ -70,10 +70,10 @@ class KVCache:
         Pre-allocate the full K and V pools.
 
         Args:
-            n_layers:    number of transformer layers (28 for Llama 3.2-3B)
+            n_layers:    number of transformer layers (32 for Llama-3.1-8B)
             max_batch:   maximum batch size this cache will ever hold
             max_seq_len: maximum sequence length (prompt + generated tokens)
-            n_heads_kv:  number of KV heads (8 for GQA in Llama 3.2-3B)
+            n_heads_kv:  number of KV heads (8 for GQA in Llama-3.1-8B)
             head_dim:    dim per head (128)
             dtype:       storage dtype — match the model (bfloat16)
             device:      cuda

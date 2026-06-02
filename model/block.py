@@ -3,7 +3,7 @@ Transformer Block — one layer of the Llama model.
 
 Architecture recap
 ------------------
-Each of the 28 Llama layers follows this structure:
+Each of the 32 Llama layers follows this structure:
 
     x → RMSNorm → Attention → + (residual) → x'
     x' → RMSNorm → MLP → + (residual) → output
@@ -14,34 +14,34 @@ not after. Why?
   - Pre-norm: each op sees normalized input → more stable training
 
 The residual connection is critical:
-  - Without it, gradients vanish through 28 layers
+  - Without it, gradients vanish through 32 layers
   - With it, there's always a "straight path" for gradients to flow backward
 
 Weight manifest for one block (layer 0 as example)
 ---------------------------------------------------
 From HuggingFace checkpoint, each layer has 9 weight tensors:
 
-  layers.0.input_layernorm.weight            (3072,)         ← attn_norm
-  layers.0.self_attn.q_proj.weight           (3072, 3072)    ← wq
-  layers.0.self_attn.k_proj.weight           (1024, 3072)    ← wk (GQA: 3× smaller)
-  layers.0.self_attn.v_proj.weight           (1024, 3072)    ← wv
-  layers.0.self_attn.o_proj.weight           (3072, 3072)    ← wo
-  layers.0.post_attention_layernorm.weight   (3072,)         ← mlp_norm
-  layers.0.mlp.gate_proj.weight              (8192, 3072)    ← w_gate
-  layers.0.mlp.up_proj.weight                (8192, 3072)    ← w_up
-  layers.0.mlp.down_proj.weight              (3072, 8192)    ← w_down
+  layers.0.input_layernorm.weight            (4096,)         ← attn_norm
+  layers.0.self_attn.q_proj.weight           (4096, 4096)    ← wq
+  layers.0.self_attn.k_proj.weight           (1024, 4096)    ← wk (GQA: 4× smaller)
+  layers.0.self_attn.v_proj.weight           (1024, 4096)    ← wv
+  layers.0.self_attn.o_proj.weight           (4096, 4096)    ← wo
+  layers.0.post_attention_layernorm.weight   (4096,)         ← mlp_norm
+  layers.0.mlp.gate_proj.weight              (14336, 4096)   ← w_gate
+  layers.0.mlp.up_proj.weight                (14336, 4096)   ← w_up
+  layers.0.mlp.down_proj.weight              (4096, 14336)   ← w_down
 
 Total per layer: 2 RMSNorms + 4 attention matrices + 3 MLP matrices.
 
 Shape flow for one forward pass
 --------------------------------
-  x                      (B, T, 3072)  ← from previous layer or embedding
-  → attn_norm            (B, T, 3072)  ← normalize
-  → attention            (B, T, 3072)  ← Q/K/V projection, rope, sdpa, output proj
-  → + x (residual)       (B, T, 3072)
-  → mlp_norm             (B, T, 3072)  ← normalize again
-  → mlp                  (B, T, 3072)  ← gate/up expand to 8192, down to 3072
-  → + x' (residual)      (B, T, 3072)  ← output
+  x                      (B, T, 4096)  ← from previous layer or embedding
+  → attn_norm            (B, T, 4096)  ← normalize
+  → attention            (B, T, 4096)  ← Q/K/V projection, rope, sdpa, output proj
+  → + x (residual)       (B, T, 4096)
+  → mlp_norm             (B, T, 4096)  ← normalize again
+  → mlp                  (B, T, 4096)  ← gate/up expand to 14336, down to 4096
+  → + x' (residual)      (B, T, 4096)  ← output
 """
 
 import torch
@@ -67,9 +67,9 @@ class TransformerBlock(nn.Module):
     ):
         """
         Args:
-            hidden_size:       dimension of residual stream (3072)
-            intermediate_size: expanded dimension in MLP (8192)
-            num_heads_q:       number of query heads (24)
+            hidden_size:       dimension of residual stream (4096)
+            intermediate_size: expanded dimension in MLP (14336)
+            num_heads_q:       number of query heads (32)
             num_heads_kv:      number of key/value heads (8, GQA)
             head_dim:          dimension per head (128)
             rope_freqs:        precomputed RoPE cos/sin tables
