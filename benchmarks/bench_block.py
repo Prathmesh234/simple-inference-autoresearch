@@ -15,22 +15,22 @@ The block benchmark captures the combined cost including:
   - MLP (SwiGLU)
   - Two residual additions
 
-This is the fundamental repeating unit of the model — 28 of these make up the
-full Llama 3.2-3B. Its latency × 28 gives a lower bound on full model cost.
+This is the fundamental repeating unit of the model — 32 of these make up the
+full Llama-3.1-8B. Its latency × 32 gives a lower bound on full model cost.
 
 Weight budget per block
 ------------------------
-  attn_norm:  (3072,)          ← tiny
-  wq:         (3072, 3072)     = 9.44M params
-  wk:         (1024, 3072)     = 3.14M params
-  wv:         (1024, 3072)     = 3.14M params
-  wo:         (3072, 3072)     = 9.44M params
-  mlp_norm:   (3072,)          ← tiny
-  w_gate:     (8192, 3072)     = 25.17M params
-  w_up:       (8192, 3072)     = 25.17M params
-  w_down:     (3072, 8192)     = 25.17M params
-  ─────────────────────────────────────────────
-  Total:      ~100.7M params × 2 bytes = ~200 MB per layer
+  attn_norm:  (4096,)          ← tiny
+  wq:         (4096, 4096)     = 16.78M params
+  wk:         (1024, 4096)     = 4.19M params
+  wv:         (1024, 4096)     = 4.19M params
+  wo:         (4096, 4096)     = 16.78M params
+  mlp_norm:   (4096,)          ← tiny
+  w_gate:     (14336, 4096)    = 58.72M params
+  w_up:       (14336, 4096)    = 58.72M params
+  w_down:     (4096, 14336)    = 58.72M params
+  ────────────────────────────────────
+  Total:      ~218.1M params × 2 bytes = ~436 MB per layer
 """
 
 import sys
@@ -48,7 +48,7 @@ from benchmarks.bench_utils import bench_fn, bandwidth_gb_s, tensor_core_util_pc
 
 DEVICE   = "cuda"
 DTYPE    = torch.bfloat16
-MODEL_ID = "meta-llama/Llama-3.2-3B"
+MODEL_ID = "meta-llama/Llama-3.1-8B"
 
 
 # ---------------------------------------------------------------------------
@@ -232,8 +232,8 @@ def run_benchmarks(cfg: ModelConfig):
                extra={"batch": B, "seq_len": T, "hidden": cfg.hidden_size,
                       "intermediate": cfg.intermediate_size, "tc_util_pct": round(tc_pct, 1)})
 
-    # Extra insight: estimated full-model cost = block × 28
-    print(f"\n  --- Full model estimate (28 blocks) ---")
+    # Extra insight: estimated full-model cost = block × 32
+    print(f"\n  --- Full model estimate (32 blocks) ---")
     print(f"  {'Config':<24} {'Est. 28-layer':>14}")
     print(f"  {'-'*24} {'-'*14}")
 
@@ -249,7 +249,7 @@ def run_benchmarks(cfg: ModelConfig):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    cfg    = ModelConfig.llama_3_2_3b()
+    cfg    = ModelConfig.llama_3_1_8b()
     loader = WeightLoader.from_pretrained(MODEL_ID)
 
     print(f"\n{'='*60}")
