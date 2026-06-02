@@ -24,7 +24,7 @@ from benchmarks.bench_utils import bench_fn, bandwidth_gb_s, tensor_core_util_pc
 
 DEVICE   = "cuda"
 DTYPE    = torch.bfloat16
-MODEL_ID = "meta-llama/Llama-3.2-3B"
+MODEL_ID = "meta-llama/Llama-3.1-8B"
 PEAK_BW  = 960.0  # GB/s, RTX 6000 Ada
 
 
@@ -154,7 +154,7 @@ def run_benchmarks(cfg: ModelConfig):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    cfg = ModelConfig.llama_3_2_3b()
+    cfg = ModelConfig.llama_3_1_8b()
 
     print(f"\n{'='*65}")
     print("  Section 14a — RMSNorm Benchmark  (PyTorch vs Triton)")

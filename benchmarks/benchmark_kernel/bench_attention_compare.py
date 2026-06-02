@@ -28,8 +28,8 @@ from benchmarks.bench_utils import bench_fn
 DEVICE   = "cuda"
 DTYPE    = torch.bfloat16
 HEAD_DIM = 128
-N_Q      = 24          # Llama-3.2-3B query heads
-N_KV     = 8           # KV heads (GQA group = 3)
+N_Q      = 32          # Llama-3.1-8B query heads
+N_KV     = 8           # KV heads (GQA group = 4)
 KV_GROUP = N_Q // N_KV
 PEAK_BW       = 960.0    # GB/s,  RTX 6000 Ada
 PEAK_TFLOPS   = 1457.0   # bf16 tensor-core
