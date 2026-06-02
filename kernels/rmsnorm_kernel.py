@@ -12,7 +12,7 @@ The PyTorch version in ops/rmsnorm.py:
     out    = normed.to(dtype) * weight    # read normed + weight, write out
 
 That's 4+ round-trips through GPU memory (DRAM) for what is logically one
-read + one write. The hidden size is only 3072 — RMSNorm is HEAVILY
+read + one write. The hidden size is 4096 — RMSNorm is HEAVILY
 memory-bound, not compute-bound.
 
 The Triton kernel does this in two passes over the row, both staying in
@@ -26,7 +26,7 @@ That is the theoretical minimum for this operation.
 Kernel design
 -------------
 - Launch one Triton program per row (one row = one token's hidden vector).
-- BLOCK_SIZE is set to the next power-of-2 >= hidden_size (4096 for H=3072)
+- BLOCK_SIZE is set to the next power-of-2 >= hidden_size (8192 for H=4096)
   so the whole row fits in a single tile and we avoid the looping path.
 - Computations over the row happen in float32 (matches PyTorch reference).
 - Output is written back in the input dtype (bfloat16 for Llama).
@@ -62,9 +62,9 @@ def _rmsnorm_fwd(
     w_ptr,        # weight (N,)
     out_ptr,      # output (n_rows, N)
     stride_row,   # x_ptr stride between rows (== N for contiguous)
-    N,            # hidden_size (3072)
+    N,            # hidden_size (4096)
     eps,
-    BLOCK_SIZE: tl.constexpr,   # next_power_of_2(N), e.g. 4096
+    BLOCK_SIZE: tl.constexpr,   # next_power_of_2(N), e.g. 8192
 ):
     """
     One Triton program per row.
@@ -132,14 +132,14 @@ def rmsnorm_triton(
     # our kernel does not understand B, T, h shit it only wants a tensor rows and cols
     ## we will make each of row something like this B*T and each col will be the hidden state
     x_2d = x.reshape(-1, x.shape[-1])
-    n_rows, N = x_2d.shape           # N = hidden_size, e.g. 3072
+    n_rows, N = x_2d.shape           # N = hidden_size, e.g. 4096
     x_stride  = x_2d.stride(0)
 
     ##now we need an output tensor — same flat shape, reshape back at the end
     out = torch.empty_like(x_2d)
 
     ## block size: smallest power of 2 ≥ N so the row fits in one tile
-    BLOCK_SIZE = triton.next_power_of_2(N)   # 3072 → 4096
+    BLOCK_SIZE = triton.next_power_of_2(N)   # 4096 → 8192
 
     ## grid = ONE program per row.  BLOCK_SIZE is the per-row tile width,
     ## not a row-partitioning, so cdiv was wrong.  Just (n_rows,).

@@ -14,7 +14,7 @@ Attention for one head is:
     O = P @ V                 # (T, d)   output
 
 The trap is the T×T score matrix `S`. For T = 8192 and bf16 that is
-8192 * 8192 * 2 = 128 MB **per head**. Llama-3.2-3B has 24 heads × 28 layers,
+8192 * 8192 * 2 = 128 MB **per head**. Llama-3.1-8B has 32 heads × 32 layers,
 so writing `S` out would push terabytes through HBM during a single prefill.
 The textbook formulation is O(T²) in both compute *and* memory traffic.
 
