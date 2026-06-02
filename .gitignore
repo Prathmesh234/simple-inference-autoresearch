@@ -15,3 +15,7 @@ profiling/**/*.nsys-rep
 profiling/**/*.ncu-rep
 # Per-run generation metrics
 metrics/
+
+# Autoresearch experiment log + run output (kept untracked per program.md)
+results.tsv
+run.log
