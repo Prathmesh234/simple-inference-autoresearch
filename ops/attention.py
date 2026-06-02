@@ -158,7 +158,12 @@ class GroupedQueryAttention(nn.Module):
 
         if USE_TRITON and q.is_cuda:
             from kernels.attention_kernel import attention_flash_triton
-            out = attention_flash_triton(q, k, v, causal=causal)
+            # q/k/v are strided views (q is transposed; k/v are KVCache prefix
+            # slices) but all have a contiguous head_dim, which is all the flash
+            # kernel needs — it indexes every dim with explicit strides. Passing
+            # assume_contiguous=True skips a per-step .contiguous() copy of the
+            # whole K/V prefix (heavy HBM traffic + peak VRAM for long contexts).
+            out = attention_flash_triton(q, k, v, causal=causal, assume_contiguous=True)
         else:
             if self.num_kv_groups > 1:
                 k = k.repeat_interleave(self.num_kv_groups, dim=1)
