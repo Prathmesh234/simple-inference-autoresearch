@@ -17,23 +17,23 @@ then weighted sum over V.
 What GQA changes
 -----------------
 In standard MHA, every head has its own K and V projections.
-GQA uses fewer KV heads than Q heads — here 8 KV heads vs 24 Q heads.
-Each KV head is shared by 3 Q heads (num_kv_groups = 24 / 8 = 3).
+GQA uses fewer KV heads than Q heads — here 8 KV heads vs 32 Q heads.
+Each KV head is shared by 4 Q heads (num_kv_groups = 32 / 8 = 4).
 
 Memory saving: KV cache stores K and V for every layer and every position.
-  MHA:  n_heads_q  KV heads = 24 heads → 24 × head_dim per token per layer
+  MHA:  n_heads_q  KV heads = 32 heads → 32 × head_dim per token per layer
   GQA:  n_heads_kv KV heads =  8 heads →  8 × head_dim per token per layer
-  Saving: 3× less KV cache memory at no meaningful quality loss.
+  Saving: 4× less KV cache memory at no meaningful quality loss.
 
-Implementation: repeat each KV head 3 times so the shape matches Q,
+Implementation: repeat each KV head 4 times so the shape matches Q,
 then run standard attention. This is done in-memory (no extra parameters).
 
-Weight shapes for Llama 3.2-3B
+Weight shapes for Llama-3.1-8B
 --------------------------------
-  wq: (n_heads_q  * head_dim, hidden) = (3072, 3072)
-  wk: (n_heads_kv * head_dim, hidden) = (1024, 3072)   ← 3× smaller than wq
-  wv: (n_heads_kv * head_dim, hidden) = (1024, 3072)
-  wo: (hidden, n_heads_q * head_dim)  = (3072, 3072)
+  wq: (n_heads_q  * head_dim, hidden) = (4096, 4096)
+  wk: (n_heads_kv * head_dim, hidden) = (1024, 4096)   ← 4× smaller than wq
+  wv: (n_heads_kv * head_dim, hidden) = (1024, 4096)
+  wo: (hidden, n_heads_q * head_dim)  = (4096, 4096)
 
 Forward pass shape flow
 ------------------------

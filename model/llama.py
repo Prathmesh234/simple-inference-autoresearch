@@ -1,32 +1,32 @@
 """
-LlamaModel — the full Llama 3.2-3B prefill forward pass.
+LlamaModel — the full Llama-3.1-8B prefill forward pass.
 
 Architecture recap
 ------------------
 token_ids
   → TokenEmbedding          (vocab_size, hidden_size) lookup
-  → 28 × TransformerBlock   each = RMSNorm + Attention + RMSNorm + MLP
+  → 32 × TransformerBlock   each = RMSNorm + Attention + RMSNorm + MLP
   → RMSNorm                 final layer norm
-  → OutputProjection        (hidden_size → vocab_size) logits, tied weights
+  → OutputProjection        (hidden_size → vocab_size) logits, untied weights
 
-The residual stream flows through all 28 blocks unchanged in shape:
-  (B, T, 3072)  the entire time.
+The residual stream flows through all 32 blocks unchanged in shape:
+  (B, T, 4096)  the entire time.
 
 Weight manifest
 ---------------
-  embed_tokens.weight              (128256, 3072)   ← TokenEmbedding
-  layers.{0..27}.*                 9 tensors each   ← TransformerBlock
-  norm.weight                      (3072,)          ← final RMSNorm
-  lm_head.weight                   (128256, 3072)   ← tied to embed_tokens
+  embed_tokens.weight              (128256, 4096)   ← TokenEmbedding
+  layers.{0..31}.*                 9 tensors each   ← TransformerBlock
+  norm.weight                      (4096,)          ← final RMSNorm
+  lm_head.weight                   (128256, 4096)   ← separate lm_head (untied)
 
 Parameter count sanity check
 -----------------------------
-  Embed + head (tied):   128256 × 3072 × 2 bytes = 787 MB  (counted once)
-  28 × attention:        28 × (9.44+3.14+3.14+9.44)M = 28 × 25.16M = 704.5M
-  28 × MLP:              28 × (25.17+25.17+25.17)M   = 28 × 75.5M  = 2114.3M
-  28 × 2 norms:          28 × 2 × 3072               = negligible
-  Final norm:            3072                         = negligible
-  Total:                 ~3.213B parameters
+  Embed + head (untied): 2 × 128256 × 4096          = 1050.6M
+  32 × attention:        32 × (16.78+4.19+4.19+16.78)M = 32 × 41.94M = 1342.1M
+  32 × MLP:              32 × (58.72+58.72+58.72)M   = 32 × 176.16M = 5637.1M
+  32 × 2 norms:          32 × 2 × 4096               = negligible
+  Final norm:            4096                         = negligible
+  Total:                 ~8.03B parameters
 """
 
 import torch
@@ -68,7 +68,7 @@ class LlamaModel(nn.Module):
         # Token embedding table (owns the weight; OutputProjection will share it)
         self.embed = TokenEmbedding(cfg.vocab_size, cfg.hidden_size)
 
-        # 28 transformer blocks — all share the same RopeFrequencies instance
+        # 32 transformer blocks — all share the same RopeFrequencies instance
         self.layers = nn.ModuleList([
             TransformerBlock(
                 hidden_size=cfg.hidden_size,
@@ -82,11 +82,13 @@ class LlamaModel(nn.Module):
             )
             for i in range(cfg.num_hidden_layers)
         ])
-        # Final layer norm (applied after all 28 blocks)
+        # Final layer norm (applied after all 32 blocks)
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
-        # Output projection — shares embed's weight tensor (tied embeddings)
-        self.head = OutputProjection(self.embed)
+        # Output projection. When the checkpoint ties embeddings (tied checkpoints)
+        # this shares embed's weight; otherwise (Llama-3.1-8B) it owns a separate
+        # lm_head weight loaded in load_weights().
+        self.head = OutputProjection(self.embed, tied=cfg.tie_word_embeddings)
 
     def load_weights(self, loader: WeightLoader):
         """Load all weights from the checkpoint into this model."""
@@ -95,7 +97,7 @@ class LlamaModel(nn.Module):
         # Embedding table
         self.embed.load_weight(loader.get("embed_tokens").to(dtype))
 
-        # All 28 blocks
+        # All 32 blocks
         for i, block in enumerate(self.layers):
             block.load_weights(
                 attn_norm_weight=loader.get(f"layers.{i}.attn_norm").to(dtype),
@@ -112,17 +114,11 @@ class LlamaModel(nn.Module):
         # Final norm
         self.norm.load_weight(loader.get("norm").to(dtype))
 
-        # lm_head: in Llama 3.2 tied embeddings means lm_head == embed_tokens.
-        # The OutputProjection already references embed.weight, so nothing to do.
-        # But if the checkpoint has an explicit lm_head key that differs, load it:
-        try:
-            lm_head_w = loader.get("lm_head")
-            # Only override if it's actually a different tensor (non-tied checkpoint)
-            if not torch.equal(lm_head_w.cpu(), self.embed.weight.data.cpu()):
-                with torch.no_grad():
-                    self.embed.weight.copy_(lm_head_w.to(dtype))
-        except (KeyError, Exception):
-            pass  # tied — no separate lm_head weight
+        # lm_head: tied embeddings (tied checkpoints) reuse embed.weight, so the
+        # OutputProjection already points at it — nothing to load. Untied models
+        # (Llama-3.1-8B) carry a separate lm_head.weight we load explicitly.
+        if not self.cfg.tie_word_embeddings:
+            self.head.load_weight(loader.get("lm_head").to(dtype))
 
     def forward(
         self,
@@ -144,7 +140,7 @@ class LlamaModel(nn.Module):
         # 1. Embed tokens → residual stream
         x = self.embed(token_ids)                      # (B, T, hidden_size)
 
-        # 2. Pass through all 28 transformer blocks
+        # 2. Pass through all 32 transformer blocks
         for layer in self.layers:
             x = layer(x, start_pos=start_pos, kv_cache=kv_cache)
 
@@ -167,8 +163,10 @@ class LlamaModel(nn.Module):
         from loader import WeightLoader
 
         device = torch.device(device)
-        cfg = ModelConfig.llama_3_2_3b()
         loader = WeightLoader.from_pretrained(model_id)
+        # Read the real architecture from the downloaded config.json so this works
+        # for any Llama variant (tied checkpoints, Llama-3.1-8B untied, ...).
+        cfg = ModelConfig.from_hf_config(loader.model_dir / "config.json")
 
         model = cls(cfg, device)
         model.load_weights(loader)
