@@ -9,12 +9,12 @@ Runs:
 Why MLP is the most compute-heavy op
 --------------------------------------
 Attention weights (GQA):
-  wq (3072×3072) + wk (1024×3072) + wv (1024×3072) + wo (3072×3072)
-  Total: ~38M params per layer
+  wq (4096×4096) + wk (1024×4096) + wv (1024×4096) + wo (4096×4096)
+  Total: ~42M params per layer
 
 MLP weights (SwiGLU):
-  w_gate (8192×3072) + w_up (8192×3072) + w_down (3072×8192)
-  Total: ~75M params per layer  ← 2× more than attention
+  w_gate (14336×4096) + w_up (14336×4096) + w_down (4096×14336)
+  Total: ~176M params per layer  ← 4× more than attention
 
 More parameters = more FLOPs per token = more time at both prefill and decode.
 """
@@ -33,7 +33,7 @@ from benchmarks.bench_utils import bench_fn, bandwidth_gb_s, tensor_core_util_pc
 
 DEVICE   = "cuda"
 DTYPE    = torch.bfloat16
-MODEL_ID = "meta-llama/Llama-3.2-3B"
+MODEL_ID = "meta-llama/Llama-3.1-8B"
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +153,7 @@ def run_benchmarks(cfg: ModelConfig):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    cfg    = ModelConfig.llama_3_2_3b()
+    cfg    = ModelConfig.llama_3_1_8b()
     loader = WeightLoader.from_pretrained(MODEL_ID)
 
     print(f"\n{'='*60}")

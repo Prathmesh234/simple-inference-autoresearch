@@ -9,12 +9,12 @@ Runs:
 
 What this measures
 ------------------
-The full forward pass: embed → 28 × block → norm → lm_head.
+The full forward pass: embed → 32 × block → norm → lm_head.
 
 Key numbers to understand:
   - Prefill throughput (tokens/sec) = T / latency_s
     This is what determines time-to-first-token.
-  - 28 × block estimate from bench_block tells us how close we are to
+  - 32 × block estimate from bench_block tells us how close we are to
     that lower bound (overhead from embed/norm/head should be tiny).
   - VRAM at prefill grows with T (activations for all T tokens live in memory).
 """
@@ -33,7 +33,7 @@ from benchmarks.bench_utils import bench_fn, record, print_results
 
 DEVICE   = "cuda"
 DTYPE    = torch.bfloat16
-MODEL_ID = "meta-llama/Llama-3.2-3B"
+MODEL_ID = "meta-llama/Llama-3.1-8B"
 
 PROMPT = "The capital of France is"
 
@@ -91,7 +91,7 @@ def check_correctness(model: LlamaModel, cfg: ModelConfig):
 
 def run_benchmarks(model: LlamaModel, cfg: ModelConfig):
     print("\n--- Benchmarks ---")
-    print("  Measuring prefill: embed → 28 blocks → norm → lm_head\n")
+    print("  Measuring prefill: embed → 32 blocks → norm → lm_head\n")
 
     shapes = [
         ("prefill T=128",  1, 128),
@@ -139,7 +139,7 @@ def run_benchmarks(model: LlamaModel, cfg: ModelConfig):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    cfg    = ModelConfig.llama_3_2_3b()
+    cfg    = ModelConfig.llama_3_1_8b()
     loader = WeightLoader.from_pretrained(MODEL_ID)
 
     print(f"\n{'='*60}")
