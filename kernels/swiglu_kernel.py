@@ -13,7 +13,7 @@ The PyTorch MLP forward (ops/mlp.py) does:
     out       = fused @ W_down.T      # GEMM  (cuBLAS — already optimal)
 
 The two middle steps are two separate kernel launches and TWO round-trips
-through DRAM for an (B, T, 8192) tensor. That's the waste we kill here.
+through DRAM for an (B, T, 14336) tensor. That's the waste we kill here.
 
 After fusion: one kernel reads gate_proj + up_proj, computes
     silu(g) * u = (g * sigmoid(g)) * u

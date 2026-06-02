@@ -133,7 +133,7 @@ class WeightLoader:
 
     Usage
     -----
-        loader = WeightLoader.from_pretrained("meta-llama/Llama-3.2-3B")
+        loader = WeightLoader.from_pretrained("meta-llama/Llama-3.1-8B")
         q_weight = loader.get("layers.0.attn.wq")   # our name
         # or
         q_weight = loader.get_hf("model.layers.0.self_attn.q_proj.weight")
@@ -161,8 +161,8 @@ class WeightLoader:
         """
         Download (or find cached) a HuggingFace model and return a loader.
 
-        On first call this downloads all safetensors shards — for Llama-3.2-3B
-        that is ~6 GB. Subsequent calls are instant because huggingface_hub
+        On first call this downloads all safetensors shards — for Llama-3.1-8B
+        that is ~16 GB. Subsequent calls are instant because huggingface_hub
         caches to ~/.cache/huggingface/hub/.
         """
         print(f"Locating model: {repo_id}")
@@ -298,10 +298,10 @@ class WeightLoader:
             total += n
         return total
 
-    def verify_parameter_count(self, expected_billions: float = 3.212, tol: float = 0.01):
+    def verify_parameter_count(self, expected_billions: float = 8.03, tol: float = 0.01):
         """
         Assert that the loaded model has ~expected_billions parameters.
-        Llama-3.2-3B has 3.212B parameters (not exactly 3B, as is common).
+        Llama-3.1-8B has ~8.03B parameters.
         """
         actual = self.count_parameters()
         actual_b = actual / 1e9
@@ -327,7 +327,7 @@ class WeightLoader:
 if __name__ == "__main__":
     import sys
 
-    repo_id = "meta-llama/Llama-3.2-3B"
+    repo_id = "meta-llama/Llama-3.1-8B"
     token = sys.argv[1] if len(sys.argv) > 1 else None
 
     print(f"\n{'='*60}")
@@ -340,7 +340,7 @@ if __name__ == "__main__":
     loader.print_manifest()
 
     print()
-    loader.verify_parameter_count(expected_billions=3.212)
+    loader.verify_parameter_count(expected_billions=8.03)
 
     # Spot-check: load a single small tensor and inspect it
     print("\nSpot-check: loading embed_tokens weight...")
