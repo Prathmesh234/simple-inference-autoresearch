@@ -93,6 +93,16 @@ you work in it.
   config, weight loading, sampling, tokenization. Read them for context; the math and
   weights here must stay faithful to Llama-3.1-8B (see *Guardrails*).
 
+- **`workspace/` — your notebook (free space, ignored by the engine).** Yours to
+  think in. Drop any files you want here — research notes, your evolving map of how
+  the engine fits together, an experiment journal, half-formed ideas, anything that
+  helps you reason and remember across the loop. Nothing in here affects how the code
+  runs. **Most important: keep a "big wins" log** — whenever a change makes a real
+  difference, write up *what* you changed, the before/after numbers, and especially
+  *why* it worked (fewer bytes per token? fewer kernel launches? more sequences in
+  flight?), plus anything surprising and what it suggests next. A clear write-up of the
+  mechanism is worth more later than the raw number. See `workspace/README.md`.
+
 **The flow for any kernel change:** write/edit the kernel file in `kernels/` →
 benchmark it standalone in `benchmarks/` (correct + faster) → wire it into `ops/`/`model/`
 → run `profiling/profile_engine.py` across the full batch sweep → log the result. Never
@@ -186,6 +196,9 @@ LOOP FOREVER:
 6. **If the grep is empty, the run crashed.** Read the trace with
    `tail -n 50 run.log` and try to fix it. If you can't after a few attempts, give up.
 7. **Record the result in `results.tsv`** (leave it untracked — do not commit it).
+   When a change makes a real difference (or surprisingly doesn't), also write up the
+   *why* in `workspace/` — the mechanism behind the win, the before/after numbers, and
+   what it suggests next. That narrative is your memory across the loop.
 8. **If `best_agg_tps` improved** (higher) without breaking a guardrail
    (single-stream latency didn't collapse, VRAM still fits), **advance** — keep the
    commit. It is the new baseline.
