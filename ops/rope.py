@@ -39,7 +39,7 @@ frequencies.
 
 Llama 3 RoPE scaling
 ---------------------
-Llama 3.2-3B was pretrained on sequences up to 8192 tokens but supports
+Llama-3.1-8B was pretrained on sequences up to 8192 tokens but supports
 131,072 tokens at inference via a scaling trick:
   - Frequencies below low_freq_factor (1.0) get divided by factor (32.0)
     → slow rotation → can handle long distances
