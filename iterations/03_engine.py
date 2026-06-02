@@ -55,7 +55,7 @@ import ops.rmsnorm as rmsnorm_mod
 # ── constants ────────────────────────────────────────────────────────────────
 DEVICE              = "cuda"
 DTYPE               = torch.bfloat16
-MODEL_ID            = "meta-llama/Llama-3.2-3B"
+MODEL_ID            = "meta-llama/Llama-3.1-8B"
 DEFAULT_DECODE_TOKS = 256
 WARMUP              = 2
 
@@ -267,8 +267,8 @@ if __name__ == "__main__":
     print(f"  Sampling: temperature={TEMPERATURE}, top_k={TOP_K}, top_p={TOP_P}")
     print(f"{'='*110}")
 
-    cfg    = ModelConfig.llama_3_2_3b()
     loader = WeightLoader.from_pretrained(MODEL_ID)
+    cfg    = ModelConfig.from_hf_config(loader.model_dir / "config.json")
 
     model = LlamaModel(cfg, torch.device(DEVICE))
     model.load_weights(loader)
