@@ -9,7 +9,7 @@ Schema:
 {
   "rmsnorm": {
     "pytorch": [
-      {"label": "B=1 T=128 H=3072", "latency_ms": 0.042, "bandwidth_gb_s": 441.2},
+      {"label": "B=1 T=128 H=4096", "latency_ms": 0.042, "bandwidth_gb_s": 441.2},
       ...
     ]
   },
@@ -114,7 +114,7 @@ def record(
 
     op_name     : e.g. "rmsnorm", "attention"
     backend     : "pytorch" | "triton" | "torch_compile"
-    label       : human-readable config, e.g. "B=1 T=128 H=3072"
+    label       : human-readable config, e.g. "B=1 T=128 H=4096"
     latency_ms  : median latency from bench_fn()
     bandwidth_gb_s_val : optional, computed by caller who knows bytes_moved
     extra       : any other fields to store (e.g. {"seq_len": 128})
