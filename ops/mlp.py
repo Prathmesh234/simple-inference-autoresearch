@@ -24,21 +24,21 @@ SiLU (Sigmoid Linear Unit):
 
 Expand-then-contract pattern
 ------------------------------
-    hidden_size      = 3072
-    intermediate_size = 8192
+    hidden_size      = 4096
+    intermediate_size = 14336
 
-    x        : (B, T, 3072)   ← input from residual stream
-    gate, up : (B, T, 8192)   ← expand ~2.67×
-    y        : (B, T, 3072)   ← contract back down
+    x        : (B, T, 4096)   ← input from residual stream
+    gate, up : (B, T, 14336)  ← expand ~3.5×
+    y        : (B, T, 4096)   ← contract back down
 
 The expansion lets the model learn richer feature interactions before
 contracting back to the residual stream dimension.
 
-Weight shapes for Llama 3.2-3B
+Weight shapes for Llama-3.1-8B
 ---------------------------------
-    W_gate : (intermediate_size, hidden_size) = (8192, 3072)
-    W_up   : (intermediate_size, hidden_size) = (8192, 3072)
-    W_down : (hidden_size, intermediate_size) = (3072, 8192)
+    W_gate : (intermediate_size, hidden_size) = (14336, 4096)
+    W_up   : (intermediate_size, hidden_size) = (14336, 4096)
+    W_down : (hidden_size, intermediate_size) = (4096, 14336)
 
 No biases — consistent with the rest of the Llama architecture.
 
@@ -62,8 +62,8 @@ class SwiGLUMLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
         """
         Args:
-            hidden_size       : width of the residual stream (3072)
-            intermediate_size : width of the expanded hidden dim (8192)
+            hidden_size       : width of the residual stream (4096)
+            intermediate_size : width of the expanded hidden dim (14336)
 
         Weight layout (Section 14b Level-2 fusion)
         ------------------------------------------

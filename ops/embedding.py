@@ -28,7 +28,7 @@ Why tie them?
   - The output projection row for a token represents "how likely is this token next"
   - Tying forces these two representations to live in the same space, which
     works well in practice and saves ~1.2 GB of parameters for this model
-    (vocab_size × hidden_size × 2 bytes = 128256 × 3072 × 2 = 787 MB × 2 without tying)
+    (vocab_size × hidden_size × 2 bytes = 128256 × 4096 × 2 = 1050 MB × 2 without tying)
 
 Shape contract
 --------------
@@ -71,19 +71,34 @@ class OutputProjection(nn.Module):
     """
     The final linear layer: hidden states → vocabulary logits.
 
-    Does NOT own its weight — it holds a reference to TokenEmbedding's weight.
-    This is the tied-embedding contract: one tensor, two uses.
+    Tied case (tied checkpoints): does NOT own its weight — it holds a reference
+    to TokenEmbedding's weight. One tensor, two uses.
+
+    Untied case (e.g. Llama-3.1-8B): owns a separate lm_head weight parameter,
+    loaded from the checkpoint's `lm_head.weight`.
     """
 
-    def __init__(self, embedding: TokenEmbedding):
+    def __init__(self, embedding: TokenEmbedding, tied: bool = True):
         super().__init__()
-        # Register as a buffer reference so it moves with .to(device) calls
-        # but is NOT counted as a separate parameter
         self._embedding = embedding
+        self.tied = tied
+        if tied:
+            self._weight = None
+        else:
+            self._weight = nn.Parameter(
+                torch.empty(embedding.vocab_size, embedding.hidden_size)
+            )
 
     @property
     def weight(self) -> torch.Tensor:
-        return self._embedding.weight
+        return self._embedding.weight if self.tied else self._weight
+
+    def load_weight(self, weight: torch.Tensor):
+        """Load a separate lm_head weight (untied embeddings only)."""
+        if self.tied:
+            raise RuntimeError("OutputProjection is tied; it has no own weight to load")
+        with torch.no_grad():
+            self._weight.copy_(weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T, hidden_size)
