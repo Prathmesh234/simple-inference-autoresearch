@@ -137,7 +137,7 @@ def run_benchmarks(cfg: ModelConfig):
 
 
 if __name__ == "__main__":
-    cfg = ModelConfig.llama_3_2_3b()
+    cfg = ModelConfig.llama_3_1_8b()
 
     print(f"\n{'='*70}")
     print("  Section 11 — Attention + KV Cache Benchmark")
