@@ -41,14 +41,14 @@ from benchmarks.bench_utils import bench_fn, BASELINE_FILE
 
 DEVICE   = "cuda"
 DTYPE    = torch.bfloat16
-MODEL_ID = "meta-llama/Llama-3.2-3B"
+MODEL_ID = "meta-llama/Llama-3.1-8B"
 
 
 # ── 1. Prefill throughput ────────────────────────────────────────────────────
 
 def bench_prefill(model: LlamaModel, cfg: ModelConfig) -> list[dict]:
     print(f"\n{'─'*70}")
-    print("  1. Prefill throughput  (embed → 28 blocks → norm → lm_head)")
+    print("  1. Prefill throughput  (embed → 32 blocks → norm → lm_head)")
     print(f"{'─'*70}")
     print(f"  {'Seq len':>8}  {'Latency':>10}  {'Tok/sec':>12}  {'VRAM MB':>10}")
     print(f"  {'-------':>8}  {'-------':>10}  {'-------':>12}  {'-------':>10}")
@@ -246,7 +246,7 @@ def save_results(prefill: list, decode: list, breakdown: dict):
 
 def print_summary(prefill: list, decode: list, breakdown: dict):
     print(f"\n{'='*70}")
-    print("  BASELINE SUMMARY — Llama 3.2-3B, bfloat16, RTX 6000 Ada")
+    print("  BASELINE SUMMARY — Llama-3.1-8B, bfloat16, RTX 6000 Ada")
     print(f"{'='*70}")
 
     print(f"\n  Prefill throughput:")
@@ -276,7 +276,7 @@ if __name__ == "__main__":
     print("  Section 13 — Full Baseline Benchmark Suite")
     print(f"{'='*70}")
 
-    cfg    = ModelConfig.llama_3_2_3b()
+    cfg    = ModelConfig.llama_3_1_8b()
     loader = WeightLoader.from_pretrained(MODEL_ID)
 
     model = LlamaModel(cfg, torch.device(DEVICE))
