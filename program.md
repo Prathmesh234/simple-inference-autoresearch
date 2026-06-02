@@ -13,17 +13,26 @@ running on a single GPU, in pure PyTorch + Triton, bfloat16 — measured as the
 **total tokens/second the engine sustains across a batch of concurrent requests**,
 not just one stream.
 
+There is a fundamental trade-off here between two quantities:
+
+- **Throughput** — total tokens/second the GPU pushes out across *all* requests in
+  flight (tok/s aggregate). Goes up as you batch more sequences together.
+- **Interactivity** — how fast a *single* user's stream is generated (tok/s per
+  sequence, i.e. latency per token). Goes down as the batch grows and resources are
+  split across more requests.
+
+They pull against each other: big batches amortize the weights you stream from VRAM
+across many tokens and lift total throughput, but they slow each individual stream;
+small batches keep one stream fast but waste the GPU. Plot throughput against
+interactivity and every engine traces a curve — the **frontier** of what's
+achievable. **Your job is to push that whole frontier outward**: more total
+throughput at any given interactivity level, not just one lucky operating point.
+
 A single decode step at batch size 1 is memory-bandwidth bound and leaves the GPU
-mostly idle. The big wins come from keeping more requests in flight per step so
-the weights you stream from VRAM are amortized across many tokens. So you care
-about two things at once:
-
-- **Single-stream decode speed** (latency per token at batch size 1).
-- **Aggregate throughput under batching** (total tok/s as batch size grows) — how
-  well the engine scales when many sequences decode together.
-
-Maximize aggregate throughput without letting single-stream latency collapse.
-Optimize this relentlessly.
+mostly idle, so the headroom is real. Win by moving fewer bytes per token, packing
+more sequences into each step, and keeping the GPU busy — **raise aggregate
+throughput without letting single-stream interactivity collapse.** Optimize this
+relentlessly.
 
 ## Guardrails (do not regress these)
 
