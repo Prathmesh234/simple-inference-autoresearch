@@ -20,7 +20,7 @@ from benchmarks.bench_utils import bench_fn
 DEVICE   = "cuda"
 DTYPE    = torch.bfloat16
 HEAD_DIM = 128
-N_Q      = 24
+N_Q      = 32
 N_KV     = 8
 PEAK_BW  = 960.0       # GB/s, RTX 6000 Ada
 

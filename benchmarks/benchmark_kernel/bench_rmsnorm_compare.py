@@ -20,7 +20,7 @@ from benchmarks.bench_utils import bench_fn
 
 DEVICE   = "cuda"
 DTYPE    = torch.bfloat16
-H        = 3072        # Llama 3.2-3B hidden size
+H        = 4096        # Llama-3.1-8B hidden size
 EPS      = 1e-5
 PEAK_BW  = 960.0       # GB/s, RTX 6000 Ada
 
