@@ -173,7 +173,10 @@ def w8a16_linear_triton(
             BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 128
             num_stages, num_warps = 3, 4
         else:
-            BLOCK_M, BLOCK_N, BLOCK_K = 32, 128, 128
+            # down (N=4096, K=14336): MIN-bench (EXP-L) found BLOCK_K=256 is
+            # ~1.1x over BLOCK_K=128 (94 vs 109us) — the original tuner grid
+            # never tried BK=256. st=4 spills smem at BK=256, so keep st=3/nw=8.
+            BLOCK_M, BLOCK_N, BLOCK_K = 32, 128, 256
             num_stages, num_warps = 3, 8
     else:
         # prefill (large M): tuner best gate_up/down (128,256,64,*,8).
