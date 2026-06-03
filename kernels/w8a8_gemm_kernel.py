@@ -159,6 +159,99 @@ def w8a8_linear_triton(
     return y.reshape(*orig_shape[:-1], N)
 
 
+@triton.jit
+def _w8a8_swiglu_fwd(x_ptr, w_ptr, xs_ptr, ws_ptr, y_ptr, M, I, K,
+                     sxm, sxk, swn, swk, sym, syn,
+                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                     BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
+    """Fused gate_up W8A8 GEMM + SwiGLU epilogue.
+
+    y[m, n] = silu(gate) * up   where
+        gate = (x_int8 @ Wg.T) * act_scale[m] * w_scale[n]
+        up   = (x_int8 @ Wu.T) * act_scale[m] * w_scale[I + n]
+    Wg = w rows [0, I)   (gate),   Wu = w rows [I, 2I)  (up).
+    Two int32 accumulators are accumulated in the K-loop so the (M, 2I)
+    intermediate is never materialised and the standalone swiglu launch is
+    removed. Output is (M, I) bf16, consumed directly by the down projection.
+    """
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(I, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)) % M
+    offs_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) % I
+    offs_k = tl.arange(0, BLOCK_K)
+    x_ptrs = x_ptr + offs_m[:, None] * sxm + offs_k[None, :] * sxk
+    wg_ptrs = w_ptr + offs_n[:, None] * swn + offs_k[None, :] * swk
+    wu_ptrs = w_ptr + (I + offs_n)[:, None] * swn + offs_k[None, :] * swk
+
+    acc_g = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    acc_u = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for _ in range(0, tl.cdiv(K, BLOCK_K)):
+        a = tl.load(x_ptrs)
+        bg = tl.load(wg_ptrs)
+        bu = tl.load(wu_ptrs)
+        acc_g += tl.dot(a, bg.T, out_dtype=tl.int32)
+        acc_u += tl.dot(a, bu.T, out_dtype=tl.int32)
+        x_ptrs += BLOCK_K * sxk
+        wg_ptrs += BLOCK_K * swk
+        wu_ptrs += BLOCK_K * swk
+
+    xsc = tl.load(xs_ptr + offs_m)[:, None].to(tl.float32)
+    wsg = tl.load(ws_ptr + offs_n)[None, :].to(tl.float32)
+    wsu = tl.load(ws_ptr + I + offs_n)[None, :].to(tl.float32)
+    gate = acc_g.to(tl.float32) * xsc * wsg
+    up = acc_u.to(tl.float32) * xsc * wsu
+    out = (gate * tl.sigmoid(gate)) * up
+
+    offs_ym = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_yn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    y_ptrs = y_ptr + offs_ym[:, None] * sym + offs_yn[None, :] * syn
+    tl.store(y_ptrs, out.to(tl.bfloat16),
+             mask=(offs_ym[:, None] < M) & (offs_yn[None, :] < I))
+
+
+def w8a8_swiglu_prequant(
+    x_int8: torch.Tensor,
+    act_scale: torch.Tensor,
+    w_gate_up_int8: torch.Tensor,
+    w_gate_up_scale: torch.Tensor,
+    orig_shape,
+) -> torch.Tensor:
+    """Fused gate_up W8A8 GEMM + SwiGLU when the activation is already int8.
+
+    Replaces (w8a8_linear_prequant -> chunk -> swiglu_triton) for the decode
+    bucket: produces silu(gate)*up of shape (..., I) in one kernel, skipping the
+    (M, 2I) intermediate write and the separate swiglu launch (EXP-E).
+
+    BLOCK_N is pinned to 64: the two int32 accumulators spill registers at
+    BLOCK_N>=128 (catastrophic ~17x slowdown), while 64 is the stable optimum.
+    """
+    M, K = x_int8.shape
+    two_I = w_gate_up_int8.shape[0]
+    I = two_I // 2
+    y = torch.empty((M, I), dtype=torch.bfloat16, device=x_int8.device)
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 128
+    num_stages, num_warps = 2, 4
+    GROUP_M = 8
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(I, BLOCK_N),)
+    _w8a8_swiglu_fwd[grid](
+        x_int8, w_gate_up_int8, act_scale, w_gate_up_scale, y, M, I, K,
+        x_int8.stride(0), x_int8.stride(1),
+        w_gate_up_int8.stride(0), w_gate_up_int8.stride(1),
+        y.stride(0), y.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=GROUP_M,
+        num_stages=num_stages, num_warps=num_warps,
+    )
+    return y.reshape(*orig_shape[:-1], I)
+
+
 def w8a8_linear_prequant(
     x_int8: torch.Tensor,
     act_scale: torch.Tensor,
