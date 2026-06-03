@@ -144,8 +144,15 @@ class SwiGLUMLP(nn.Module):
         """
         if USE_TRITON and x.is_cuda:
             from kernels.w8a16_gemm_kernel import w8a16_linear_triton
-            # --- 1. Fused gate + up projection (int8 weights) ---
-            combined = w8a16_linear_triton(
+            from kernels.w8a8_gemm_kernel import w8a8_linear_triton
+            # --- 1. Fused gate + up projection (W8A8 int8 tensor cores) ---
+            # gate_up is the single dominant decode GEMM (N=28672). Its input is
+            # the post-rmsnorm residual stream, whose activation outliers are
+            # absorbed by per-token dynamic int8 scaling (end-to-end rel_err
+            # matches the accepted weight-only int8). w8a8_linear_triton falls
+            # back to W8A16 for b1 (M<=16) and prefill (M>256), so only the b128
+            # decode bucket takes the int8-MMA path.
+            combined = w8a8_linear_triton(
                 x, self.w_gate_up_int8, self.w_gate_up_scale
             )                                              # (B, T, 2*intermediate)
             gate, up = combined.chunk(2, dim=-1)
