@@ -1,6 +1,6 @@
 # CHECKPOINT — read me first next session
 
-_Last updated: 2026-06-03. Branch: `autoresearch/jun2`. Pushed HEAD: `5d3c9ad`._
+_Last updated: 2026-06-03. Branch: `autoresearch/jun2`. Pushed HEAD: `b9eaa3c`._
 
 ## 30-second TLDR
 We are autonomously maximizing **`best_agg_tps`** (aggregate decode throughput at
@@ -20,7 +20,8 @@ catalog (vLLM/SGLang/TRT-LLM/FlashInfer) is `workspace/INFERENCE_ENGINE_OPTIMIZA
 
 ## What this session did (EXP11 + 1 bug fix, both KEPT & PUSHED)
 **EXP11 — weight-only INT8 (W8A16) MLP under the CUDA-graph decode.**
-- Commits: `d298ba9` (EXP11) and `5d3c9ad` (swiglu int64 fix). Both on
+- Commits: `d298ba9` (EXP11), `5d3c9ad` (swiglu int64 fix), `b9eaa3c` (w8a16 int64
+  fix — was profiled but left out of d298ba9; pushed as a forward-fix). All on
   `origin/autoresearch/jun2`. `results.tsv` has the `keep` row.
 - WHY it wins now (the same idea LOST -13% pre-graph as EXP8): EXP10 put the whole
   decode step in a CUDA graph, so launch overhead ≈ 0 and the headline is now
