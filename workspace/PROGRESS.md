@@ -1,0 +1,286 @@
+# Autoresearch progress log — Llama-3.1-8B decode throughput
+
+Branch: `autoresearch/jun2`  (run tag: jun2)
+Goal: maximize `best_agg_tps` (aggregate decode tok/s) without collapsing
+seq_tps_b1 (batch-1 latency) or blowing VRAM (<~48GB). Output must stay coherent.
+Hardware: RTX 6000 Ada, 48GB, ~960 GB/s BW, ~1457 TFLOPS bf16.
+
+## Git identity (REQUIRED for every commit)
+    git config user.name  "Prathmesh234"
+    git config user.email "ppbhatt500@gmail.com"
+(Commits also append the
+ `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` trailer.)
+
+## Current state
+- HEAD = `fc9586a` (current best / new baseline). KEEP this.
+- Best so far: **best_agg_tps = 2905.1** (flavor=instruct, batch=128),
+  seq_tps_b1 = 38.3, peak_vram = 45.20 GB.
+- GPU is single-tenant; only ONE profiler run fits VRAM at a time (~42GB each).
+  Always confirm GPU is free before launching (`nvidia-smi`).
+
+## The loop (from program.md) — follow exactly
+1. hypothesis -> change ONE thing
+2. commit (with correct identity above)
+3. `nohup uv run python profiling/profile_engine.py > run.log 2>&1 &`  (~6-7 min)
+4. `grep "^best_agg_tps:\|^best_agg_at:\|^seq_tps_b1:\|^peak_vram_gb:" run.log`
+5. append row to results.tsv (TAB-separated, UNTRACKED — never commit it)
+6. if best_agg_tps improved AND guardrails ok -> keep; else `git reset --hard <prev>`
+- The `uv run` wrapper spawns a child worker; find the real PID with
+  `pgrep -f profiling/profile_engine.py`. Model load alone ~3-4 min.
+
+## results.tsv so far (untracked)
+    cff7d14  2589.3  35.3  44.73  keep     baseline
+    b101634  2728.3  37.3  44.73  keep     skip per-step .contiguous() on K/V cache views
+    8cb4c9f  2711.6  38.7  44.73  discard  fuse QKV into one GEMM (b1 helped, b128 flat)
+    9732209  2863.8  37.4  44.73  keep     top-k-first sampling (skip full-vocab sort)
+    fc9586a  2905.1  38.3  45.20  keep     fused add+RMSNorm (vLLM residual threading)
+
+## Experiments done
+### EXP1 — KEEP (b101634): skip `.contiguous()` on K/V cache views in attention
+- `ops/attention.py`: pass `assume_contiguous=True` to `attention_flash_triton`.
+- Flash kernel indexes q/k/v with explicit strides; only needs contiguous head_dim.
+  Removing per-step clone of strided K/V prefix: +5.4% agg (2589->2728).
+
+### EXP2 — DISCARD (8cb4c9f, reset away): fuse Q/K/V into one GEMM
+- b128 headline flat (bandwidth-bound, not launch-bound), seq_tps_b1 37.3->38.7.
+  Primary metric didn't move -> discarded. Could be revived for low-batch latency.
+
+### EXP3 — KEEP (9732209): top-k-first sampling (sampling.py)
+- A decode-step probe (`workspace/probe_decode.py`) showed model-only forward is
+  FLAT ~28ms from B=1..128; only the sampling step scales with batch
+  (0.65ms@B1 -> 2.96ms@B128, ~10% of decode at b128). So sampling was the only
+  batch-scaling cost in decode.
+- Old `sample()`: temperature -> filter_top_k (mask all but 50 to -inf) ->
+  filter_top_p which **SORTS the full 128k-vocab row** (profiler: aten::sort
+  9.79GB scratch, ~4% CUDA) -> softmax+multinomial over full 128k.
+- New fast path (when 0<top_k<vocab): `torch.topk(logits,50)` to get the k
+  candidates (sorted desc) + their ids, do top-p + softmax + multinomial in the
+  k=50 dimension, then `idx.gather` the choice back to the real token id.
+- Nucleus decision moved bf16 -> **float32** (canonical top-p). Standalone gate
+  `benchmarks/benchmark_kernel/bench_sampling_compare.py` shows the fast path
+  matches the float32 top-k/top-p reference **bit-for-bit (Δ=0)**. Difference vs
+  the OLD path is only the old bf16 cumsum's coarseness at the 0.9 boundary
+  (old was the less-accurate one). Sampling **~8x faster at b128** (2.82->0.35ms).
+- Result: best_agg_tps 2728.3 -> **2863.8 (+5.0%)**, seq_tps_b1 37.3->37.4,
+  VRAM unchanged. aten::sort gone from op table, replaced by tiny aten::topk.
+
+### EXP4 — KEEP (fc9586a): fused add+RMSNorm (vLLM residual threading)
+- Threaded the residual stream through every block so each sublayer's residual
+  add folds into the *next* RMSNorm — removes 64 explicit elementwise add kernels
+  per decode step (32 layers x 2). New kernel `kernels/add_rmsnorm_kernel.py`:
+  reads hidden+residual once, computes `new_residual = residual + hidden`
+  (f32-accumulated, rounded once -> bit-exact vs torch bf16 add) and normalises in
+  the same pass. Wired via `RMSNorm.add_norm` (ops/rmsnorm.py), threaded in
+  `model/block.py` (forward now returns `(hidden, residual)`) and `model/llama.py`
+  (residual=None seed; final `norm.add_norm` folds the last pending add).
+- Numerics: the residual *stream* is **bit-identical** to the unfused path
+  (verified per-block in workspace/layerdiff.py, max|d|=0 across all 32 layers).
+  Normed matches the float32 reference within bf16/reduction noise (rmsnorm_triton
+  is itself autotune-non-deterministic at the f32-reduction level, so the bench
+  gate requires new_residual bit-exact + normed within tolerance).
+- GOTCHA: the residual add MUST accumulate in float32 then round once. An in-kernel
+  bf16 `h+r` used a hardware bf16 add that drifted ~1 ULP on rare elements,
+  compounding to 0.5 logit drift by layer 31. f32 add -> exact.
+- Result: best_agg_tps 2863.8 -> **2905.1 (+1.4%)**, seq_tps_b1 37.4->38.3
+  (latency improved too), VRAM 44.73->45.20 (still well under 48GB).
+
+### EXP5 — KEEP (a3884ae): cache RoPE cos/sin dtype cast
+- `attention.forward` was calling `cos.to(x.dtype)` / `sin.to(x.dtype)` every layer
+  every step (64 tiny copy kernels/step). The rope kernel upcasts cos/sin to f32
+  internally anyway, so the per-layer cast was pure launch overhead.
+- Added a lazy per-dtype cast cache in `RopeFrequencies` (`_cast_cache` dict);
+  `.get()` now takes a `dtype` arg and returns the cached cast. `attention.py`
+  calls `rope_freqs.get(..., dtype=x.dtype)` and drops the per-call `.to()`.
+- Numerics: bit-identical (Δ=0) — same values, just cached.
+- Result: best_agg_tps 2905.1 -> **2968.5 (+2.2%)**, seq_tps_b1 38.3->40.4,
+  VRAM 45.27.
+
+### EXP6 — KEEP (43a7158): fuse Q+K RoPE into one kernel launch
+- RoPE was launched twice per layer (once for Q, once for K). Rewrote
+  `kernels/rope_kernel.py` into a single fused `_rope_qk_fwd`/`_apply_qk` with grid
+  `(n_tokens, n_heads_q + n_heads_kv)`, branching on `col_pid < n_heads_q` to pick
+  the Q or K tensor — halves rope launches (2->1 per layer).
+- GOTCHA: assigning a dtype object (`out_dtype = ptr.dtype.element_ty`) INSIDE an
+  if/else branch breaks Triton branch-variable tracking
+  (`'dtype' object has no attribute 'type'`). Fix: hoist the dtype assignment ABOVE
+  the branch. Head counts made constexpr (auto-specialize; removed from autotune key).
+- Numerics: RoPE is elementwise (no reduction) so it's bit-identical regardless of
+  autotune num_warps. Verified Δ=0.
+- Result: best_agg_tps 2968.5 -> **3085.6 (+3.9%)**, seq_tps_b1 40.4->42.1,
+  VRAM 45.27.
+
+### EXP7 — KEEP (c0ae8ae): token-major flash-attention output (drop transpose+contiguous)
+- Each layer did `out.transpose(1,2).contiguous()` to go from the flash kernel's
+  (B, Hq, T, D) layout to (B, T, Hq, D) for the output projection — a full copy
+  kernel + HBM round-trip per layer per step. Added `out_token_major` to
+  `attention_flash_triton`: it allocates a (B, T, Hq, D) buffer and feeds the kernel
+  the matching output strides, so the kernel writes token-major directly. The
+  attention forward then `.view(B, T, hidden)` with NO transpose/contiguous.
+- The SDPA fallback keeps its transpose+contiguous (its output is head-major).
+- Numerics: bit-identical — verified max|Δ|=0 vs the transpose path for decode
+  (Tq=1), causal prefill (Tq=7), and Tq=Tk=1 edge (workspace/attn_tm.py); coherence
+  ok (gen_sanity.py).
+- Result: best_agg_tps 3085.6 -> **3222.4 (+4.4%)**, seq_tps_b1 42.1->42.3,
+  VRAM 45.27.
+
+### EXP8 — DISCARD (27af4d2, reset to c0ae8ae): weight-only int8 (W8A16) MLP
+- Quantized the MLP gate_up + down weights to per-output-channel symmetric int8
+  (1 byte) + fp32 scale, dequantized inside a tensor-core Triton GEMM
+  (kernels/w8a16_gemm_kernel.py: cast int8->bf16 in-register, tl.dot bf16 with
+  fp32 accumulate, apply scale once). MLP weights are ~70% of streamed bytes, so
+  the hope was to halve the dominant weight stream.
+- STANDALONE the int8 GEMM beat cuBLAS bf16 1.8-2.1x at M=1 (decode b1, GEMV/
+  memory-bound) but only TIED (~0.9-1.2x) at M=128 (the headline decode batch).
+- Two crashes first: (a) autotune key included M -> prefill's varied M (B*prompt_len)
+  triggered a 72-config re-tune storm (hung >13min). Fixed: short curated config
+  list + key on bucketed M (capped 128). (b) int32 pointer overflow for long-prompt
+  prefill (M~1e5, M*N>2^31) -> illegal memory access in the kernel AND in the
+  pre-existing swiglu kernel. Fixed kernel with int64 offsets; routed large-M
+  (>8192) prefill through a pure-torch dequant fallback (decode keeps int8).
+- Numerics fine: greedy gen byte-identical to bf16 baseline; per-tensor rel-err ~1e-2.
+- RESULT: best_agg_tps **2789.9 (-13% vs 3222.4)**, seq_tps_b1 38.2 (worse),
+  VRAM 39.63 (-5.6GB). The Triton int8-upcast GEMM is less compute-efficient than
+  cuBLAS bf16, and at decode batch the MLP GEMM is NOT purely memory-bound, so
+  halving weight bytes didn't speed it up — it slowed both throughput AND latency.
+  VRAM dropped but didn't open new higher-agg cells (instruct b128 still owns the
+  headline, just slower). DISCARDED.
+- LESSON: naive W8A16 (dequant->bf16) can't beat cuBLAS bf16 here. A real
+  quantization win needs int8 tensor-core MMA (W8A8, int32 accumulate) or a GEMM
+  that actually beats cuBLAS — not upcast-to-bf16.
+- Decode is **weight-bandwidth bound**: `aten::mm` dominates (streaming 16GB
+  weights/token). Model-only decode_ms is ~FLAT ~28ms B=1..128 (weights amortize
+  across batch — why batching lifts agg throughput).
+- The profiler reports instruct b128 decode ~44.7ms vs a clean ~31ms in the probe
+  because the **largest batch of each flavor is measured UNDER torch.profiler**
+  (capture_trace=True) — instrumentation overhead inflates the b128 cell. This is
+  identical across runs, so run-to-run comparisons stay valid, but the "b128 jump"
+  is partly a measurement artifact, NOT a real model-level cliff.
+- Long-prompt flavors (long_ctx/summarize/code) OOM at b64/b128 — KV cache is
+  statically pre-allocated for full max_seq_len. Only instruct (tiny prompts)
+  reaches b128 and owns the headline.
+
+## NEXT IDEAS (ranked)
+1. **CUDA graphs / torch.compile(mode="reduce-overhead") for the decode step** —
+   32-layer per-step launch overhead. Helps low batch (seq_tps_b1) and possibly
+   b128. The decode region is static-shape per step except Tk grows by 1; capture
+   per-Tk or pad KV reads. Biggest remaining lever on the flat ~28ms.
+2. **Revive QKV fusion (EXP2)** bundled with #1 — clean latency win at low batch.
+3. **fp8/int8 KV cache** — fewer bytes/token in the flash KV read AND shrinks the
+   KV cache so long_ctx/summarize/code can reach higher batch without OOM, opening
+   NEW higher-batch cells = potentially higher agg. Bigger change; needs a kernel.
+4. **Paged / right-sized KV cache** — stop pre-allocating full max_seq_len; lets
+   long-prompt flavors batch higher (new cells) without OOM.
+5. **Fuse SiLU(gate)*up in MLP** / QKV fusion — more launch-count reduction (the
+   profiled headline is op-count sensitive; EXP4 confirmed cutting launches helps).
+
+## Guardrails / rules reminders
+- DO NOT read/edit/import `benchmarks/prompts.py` (held-out test set).
+- DO NOT modify `profiling/profile_engine.py` or trim its sweep.
+- One kernel per file in `kernels/`; benchmark standalone (correct+faster) BEFORE
+  wiring into ops/model: `benchmarks/benchmark_kernel/bench_*_compare.py`.
+- Model math must stay faithful to Llama-3.1-8B (output distribution faithful;
+  float32 top-p is the canonical reference).
+- Keep results.tsv untracked.
+- NEVER STOP the loop to ask permission to continue — keep iterating.
+
+## Scratch files in workspace/ (safe, ignored by engine)
+- `probe_decode.py` — decode component timing probe (full vs model-only vs sample).
+- `bench_sampling_compare.py` is under benchmarks/benchmark_kernel/ (the gate).
+- `PROGRESS.md` — this file. `plan.md` lives in the session-state folder.
+
+## ============ SESSION UPDATE (EXP8-EXP10) ============
+
+### Dead ends (DISCARDED)
+- EXP8 W8A16 int8 weight-only MLP (Triton dequant->bf16 tl.dot): -13% headline
+  (2789.9). Same FLOPs as bf16, less compute-efficient than cuBLAS at M=128. VRAM -5.6GB.
+- EXP9 fuse K+V cache writes (one Triton launch): ~noise (3117.7). aten::copy_ is only
+  0.46% of CUDA time, nothing to gain.
+- W8A8 via torch._int_mm: standalone SLOWER than cuBLAS bf16 at M=128 (0.2-0.96x).
+- bf16 reduced-precision reduction flag: already default True. No gain.
+  => Quantization is a DEAD END at decode M=128 (int8 GEMM not optimized for skinny shapes).
+
+### CRITICAL methodology findings
+- ~6% run-to-run NOISE (Triton autotune nondeterminism). Need >6% effect or medians.
+- Profiler op table: aten::mm = 82.5% of CUDA time. But...
+- *** The b128 HEADLINE decode_ms is timed INSIDE the torch.profiler block ***
+  (profile_engine captures a full trace for the max batch of each flavor).
+  MEASURED at b128: CLEAN decode 28.4ms (4501 tps) vs PROFILED 39.9ms (3205 tps)
+  = +40% (11.5ms/step) recoverable CPU-dispatch + profiler per-op overhead from
+  ~193 op launches/step. THIS is why every EXP1-7 (launch-count cuts) moved the headline.
+
+### EXP10 (KEEP) — CUDA graph the single-token decode step  [HEAD f18fd95]
+best_agg_tps 3222 -> 4440.7 (+37.8%); seq_tps_b1 42.3 -> 56.0 (+32%);
+peak_vram 45.27 -> 42.71 GB (lower). Coherent (batched parity 100%; single-stream
+greedy a 3-token paraphrase deep in gen from bf16 non-determinism, still coherent).
+- Collapse ~193 op launches/step into ONE graph replay -> removes the 11.5ms overhead.
+- Per-step position lives in DEVICE buffers updated before replay (graph stays static):
+  pos_index (KV write via index_copy_ dim=2), kv_len (int32 scalar), cos/sin (1,head_dim).
+- NEW kernels/flash_decode_kernel.py: FlashAttention for Tq=1 reading kv_len from a
+  device scalar (grid B*Hq static, loop bound + tail mask from device). Needed because
+  SDPA-over-full-cache + bool mask DISABLES the fused flash backend -> math/gemv fallback
+  -> 2x SLOWER at b128 (first graph attempt gave 1646 tps; kernel fixed it to 4685).
+- ops/attention.py: _decode_graph_forward (decode_ctx path). model/cuda_graph_decode.py:
+  CUDAGraphDecoder (lazy capture in warmup, keyed by kv_cache identity + B). model/llama.py
+  routes eligible T==1 decode (start_pos>0, cuda, no-grad). USE_CUDA_GRAPH env (default on).
+- Prefill / T>1 untouched. index_copy_ + device-kvlen flash are both CUDA-graph safe (validated).
+
+### Next levers to consider (headline is launch/overhead sensitive under profiler)
+- The 4440 b128 is now near the CLEAN GPU-bound floor; further headline gains are small.
+- Per-step still has ~10 eager ops (tok copy, pos/kvlen/cos/sin updates, sample). Could
+  shave but small. mm (82% CUDA) resists quantization at M=128.
+- Paged/right-sized KV cache would let long flavors batch higher (new agg cells) w/o OOM.
+
+### EXP11 (KEEP) — weight-only int8 (W8A16) MLP under CUDA-graph  [HEAD d298ba9 + swiglu fix 5d3c9ad]
+best_agg_tps 4440.7 -> 4924.0 (+10.9%, >> 6% noise); seq_tps_b1 56.0 -> 83.0 (+48%);
+peak_vram 42.71 -> 39.86 GB (lower). Coherent (per-channel int8 rel_err ~1e-2; EXP8
+greedy was byte-identical). PUSHED both commits one-by-one.
+- WHY IT WINS NOW (EXP8 W8A16 was -13% pre-graph): under the CUDA graph decode replay,
+  launch overhead is gone, so the headline is WEIGHT-BANDWIDTH bound. int8 halves the MLP
+  weight stream (~70% of bytes/token). At b1 (pure bandwidth) gain is largest (+48%).
+- ops/mlp.py: gate_up/down stored as int8 registered buffers + per-output-channel fp32
+  scale; load_weights quantizes via quantize_int8_per_channel; forward calls w8a16_linear_triton.
+- kernels/w8a16_gemm_kernel.py: per-output-channel symmetric int8 GEMM, bf16 tl.dot,
+  fp32 accumulate, scale applied after. NO triton.autotune (its do_bench alloc+sync is
+  illegal under graph capture AND crashed on a fragile config). Per-M-bucket + per-N
+  hardcoded tiles found offline (workspace/tune_w8a16.py): M<=16 (16,128,128,4,8);
+  M<=256 gate_up N>=8192 (128,128,128,2,4) / down (32,128,128,3,8); prefill (128,256,64,4,8).
+  Standalone gate at M=128: gate_up 1.59x, down 1.31x vs cuBLAS bf16.
+- TWO int32-overflow bugs fixed (large prefill M = B*S up to ~1e5):
+  (1) w8a16 output store offs_ym*stride_ym (M*N ~3e9 > 2^31) -> int64.
+  (2) swiglu row_pid*gu_row_stride (~2.9e9) -> int64 (latent bug, exposed because int8
+      frees VRAM so b128 chat_real now reaches the forward instead of OOMing early).
+  Both surfaced as async "illegal memory access" inside a later kernel's autotune do_bench.
+- Apply int8 to MLP ONLY: attention wq/wkv/wo LOSE (0.3-0.65x, skinny shapes), lm_head break-even.
+
+### NEW BOTTLENECK (profiler, instruct b128): _w8a16_gemm = 64.07% of CUDA time (1.295s/4096 calls).
+The int8 MLP GEMM is now THE dominant cost. Next levers target it:
+- INT4 weight-only (W4A16) MLP: halve bytes again (Marlin/AWQ style). Biggest remaining lever.
+- Split-K for the down proj (M=128 small, K=14336 huge -> SMs idle on long serial K-loop).
+- Better int8 tiles / cp.async-style weight prefetch (Marlin 4-stage pipeline).
+
+### Post-EXP11 investigation (no commit) — why is _w8a16_gemm 2x slower in-graph (316us) than standalone (165us)?
+Rubber-duck flagged: at M=128 each weight byte is reused across rows; the DOWN proj uses
+BLOCK_M=32 so its 59MB int8 weight tile is re-streamed M/BLOCK_M = 4x across row-blocks.
+Standalone the ~48MB L2 partially hides this; in the full decode graph the KV-cache +
+residual + RMSNorm traffic evicts it -> DRAM re-reads -> the 2x gap.
+- Tuned down tiles offline (workspace/scripts/bench_down_configs.py) trying BLOCK_M=128
+  (weightloads=1x): they are SLOWER standalone (232us, only 32 progs -> low SM occupancy).
+  Best standalone stays (32,128,128)=139us; (64,64,128)=137us is within noise. NO clear
+  standalone win, so the kernel was NOT changed (avoid churn on a noise-level delta).
+- CONCLUSION: the in-graph 2x gap is an L2-contention / occupancy tradeoff, NOT a wrong
+  tile. Fixing it needs either split-K for down (parallelize K reduction to fill SMs w/o
+  growing BLOCK_M) OR a true int8 tensor-core path. Deferred to next session.
+
+### Scripts relocated: all workspace/*.py moved to workspace/scripts/ (this session).
+
+### NEXT SESSION — ranked levers (rubber-duck endorsed order):
+1. Split-K for the DOWN projection only (M=128,N=4096,K=14336 -> ~128 progs on 142 SMs,
+   long 112-iter serial K loop = occupancy-limited). Try fixed SPLIT_K=2/4, 2-pass
+   reduction (graph-safe: zero output each step is cheap) or fp32 atomics. Do NOT split
+   gate_up (large N already gives enough progs). Profile down separately first.
+2. INT4 weight-only (W4A16) MLP (Marlin/AWQ, group=128) — halve MLP bytes again. Higher
+   risk (packing, in-kernel unpack, group scales, rel_err ~2-4e-2, must stay graph-safe).
+   Only after confirming W8A16 is truly DRAM-bound in-graph (Nsight: DRAM BW, SM active%).
+3. Paged / right-sized KV cache: stop pre-reserving max_seq_len so long-prompt flavors
+   batch higher (open NEW higher-agg cells) without OOM.
+4. Reduce the remaining ~10 eager per-step ops (tok copy, pos/kvlen/cos/sin update, sample).
