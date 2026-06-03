@@ -123,6 +123,7 @@ class TransformerBlock(nn.Module):
         residual: torch.Tensor | None = None,
         start_pos: int = 0,
         kv_cache=None,
+        decode_ctx=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         vLLM-style residual threading: the residual-add of each sublayer is
@@ -152,7 +153,7 @@ class TransformerBlock(nn.Module):
             h = self.attn_norm(x)
         else:
             h, residual = self.attn_norm.add_norm(x, residual)
-        h = self.attn(h, start_pos=start_pos, kv_cache=kv_cache)
+        h = self.attn(h, start_pos=start_pos, kv_cache=kv_cache, decode_ctx=decode_ctx)
 
         # --- 2. MLP block ---
         # Fold the attention residual add into the pre-MLP norm.
