@@ -120,28 +120,45 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        residual: torch.Tensor | None = None,
         start_pos: int = 0,
         kv_cache=None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
+        vLLM-style residual threading: the residual-add of each sublayer is
+        folded into the *next* RMSNorm (see RMSNorm.add_norm), so no explicit
+        ``x = x + h`` elementwise kernel is launched.
+
         Args:
-            x:         (B, T, hidden_size)
-            start_pos: position offset for RoPE (0 during prefill, >0 during decode)
-            kv_cache:  optional KVCache (Section 11) — None for now
+            x:         incoming hidden states (B, T, hidden_size). For the first
+                       block this is the embedding; for later blocks it is the
+                       previous block's sublayer output (the pending residual add
+                       is resolved here by add_norm).
+            residual:  the running residual stream, or None for the first block
+                       (then x itself seeds the residual).
+            start_pos: position offset for RoPE.
+            kv_cache:  optional KVCache.
 
         Returns:
-            (B, T, hidden_size)
+            (hidden, residual) — hidden is the MLP output (its residual add is
+            still pending, to be folded into the next norm); residual is the
+            stream after the attention add.
         """
-        # --- 1. Attention block with residual ---
-        # Pre-norm: normalize before passing to attention
-        h = self.attn_norm(x)
+        # --- 1. Attention block ---
+        # First block: no pending add, just normalize and seed the residual.
+        # Later blocks: residual += x (previous mlp out), then normalize.
+        if residual is None:
+            residual = x
+            h = self.attn_norm(x)
+        else:
+            h, residual = self.attn_norm.add_norm(x, residual)
         h = self.attn(h, start_pos=start_pos, kv_cache=kv_cache)
-        x = x + h  # residual connection
 
-        # --- 2. MLP block with residual ---
-        # Pre-norm: normalize before passing to MLP
-        h = self.mlp_norm(x)
+        # --- 2. MLP block ---
+        # Fold the attention residual add into the pre-MLP norm.
+        h, residual = self.mlp_norm.add_norm(h, residual)
         h = self.mlp(h)
-        x = x + h  # residual connection
 
-        return x
+        # h's residual add stays pending — resolved by the next block's
+        # attn_norm.add_norm (or the model's final norm).
+        return h, residual

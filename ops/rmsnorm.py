@@ -58,6 +58,23 @@ class RMSNorm(nn.Module):
             return rmsnorm_triton(x, self.weight, self.eps)
         return _pytorch_rmsnorm(x, self.weight, self.eps)
 
+    def add_norm(
+        self, hidden: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused residual-add + RMSNorm.
+
+        Computes ``new_residual = residual + hidden`` and ``normed =
+        rmsnorm(new_residual)`` in a single kernel, folding the residual add
+        (an otherwise separate elementwise launch) into this norm. Returns
+        ``(normed, new_residual)``. Bit-identical to ``rmsnorm(residual +
+        hidden)`` with a bf16 add — see kernels/add_rmsnorm_kernel.py.
+        """
+        if USE_TRITON and hidden.is_cuda:
+            from kernels.add_rmsnorm_kernel import add_rmsnorm_triton
+            return add_rmsnorm_triton(hidden, residual, self.weight, self.eps)
+        new_residual = residual + hidden
+        return _pytorch_rmsnorm(new_residual, self.weight, self.eps), new_residual
+
     def load_weight(self, weight: torch.Tensor):
         """Copy a tensor from the checkpoint into this module's parameter."""
         with torch.no_grad():

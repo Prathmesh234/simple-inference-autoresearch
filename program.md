@@ -263,6 +263,7 @@ commit	best_agg_tps	seq_tps_b1	peak_vram_gb	status	description
 4. `peak_vram_gb` peak VRAM in GB, `.2f` (e.g. `31.74`) — `0.0` for crashes
 5. status: `keep`, `discard`, or `crash`
 6. short text description of what this experiment tried
+7. **VERY VERY VERY IMPORTANT** - Push frequently after every optimization to the upstream. 
 
 Example:
 

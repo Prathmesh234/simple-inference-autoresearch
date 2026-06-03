@@ -140,12 +140,15 @@ class LlamaModel(nn.Module):
         # 1. Embed tokens → residual stream
         x = self.embed(token_ids)                      # (B, T, hidden_size)
 
-        # 2. Pass through all 32 transformer blocks
+        # 2. Pass through all 32 transformer blocks, threading the residual
+        #    stream so each block's residual adds fold into the next RMSNorm
+        #    (no explicit elementwise add kernels — see TransformerBlock.forward).
+        residual = None
         for layer in self.layers:
-            x = layer(x, start_pos=start_pos, kv_cache=kv_cache)
+            x, residual = layer(x, residual, start_pos=start_pos, kv_cache=kv_cache)
 
-        # 3. Final layer norm
-        x = self.norm(x)                               # (B, T, hidden_size)
+        # 3. Final layer norm — folds the last block's pending residual add in.
+        x, _ = self.norm.add_norm(x, residual)         # (B, T, hidden_size)
 
         # 4. Project to vocabulary logits
         logits = self.head(x)                          # (B, T, vocab_size)
