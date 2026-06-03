@@ -82,10 +82,34 @@ class SwiGLUMLP(nn.Module):
         self.hidden_size       = hidden_size
         self.intermediate_size = intermediate_size
 
-        # No bias — Llama uses bias=False for all linear layers
+        # Weight-only int8 (W8A16): decode is weight-bandwidth bound and the MLP
+        # weights are ~70% of the bytes streamed per token. We store them as int8
+        # (1 byte) with a per-output-channel fp32 scale instead of bf16 (2 bytes),
+        # and dequantize inside the matmul (kernels/w8a16_gemm_kernel.py). The
+        # standalone gate shows 1.6-1.7x at the M=128 decode shapes for both MLP
+        # matrices; attention/lm_head stay bf16 (they lose at decode M). With the
+        # EXP10 CUDA-graph decode the extra Triton launches replay for free, so
+        # the bandwidth saving surfaces in the profiled headline.
+        #
+        # These are buffers, not Parameters: `module.to(dtype)` skips integer
+        # tensors so the int8 storage survives the model's bf16 cast (the float
+        # scale buffers are cast to bf16, which is fine — int8 |v|<=127 is exact
+        # and per-output-channel scaling keeps coherence through 32 layers).
         # Combined gate+up: rows [0:I) are gate, rows [I:2I) are up.
-        self.w_gate_up = nn.Parameter(torch.empty(2 * intermediate_size, hidden_size))
-        self.w_down    = nn.Parameter(torch.empty(hidden_size, intermediate_size))
+        self.register_buffer(
+            "w_gate_up_int8",
+            torch.empty(2 * intermediate_size, hidden_size, dtype=torch.int8),
+        )
+        self.register_buffer(
+            "w_gate_up_scale", torch.empty(2 * intermediate_size, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "w_down_int8",
+            torch.empty(hidden_size, intermediate_size, dtype=torch.int8),
+        )
+        self.register_buffer(
+            "w_down_scale", torch.empty(hidden_size, dtype=torch.float32)
+        )
 
     def load_weights(
         self,
@@ -94,15 +118,21 @@ class SwiGLUMLP(nn.Module):
         w_down: torch.Tensor,
     ):
         """
-        Copy checkpoint tensors into parameters in-place.
+        Quantize checkpoint tensors to int8 and store them.
 
         We keep the (w_gate, w_up, w_down) external API so the loader code
-        doesn't change. The concat happens here, once at load time.
+        doesn't change. The concat (gate stacked on up) and the per-output-channel
+        int8 quantization both happen here, once at load time.
         """
+        from kernels.w8a16_gemm_kernel import quantize_int8_per_channel
         with torch.no_grad():
-            # Stack gate on top of up: cat along the output-feature dim.
-            self.w_gate_up.copy_(torch.cat([w_gate, w_up], dim=0))
-            self.w_down.copy_(w_down)
+            gate_up = torch.cat([w_gate, w_up], dim=0)
+            gu_int8, gu_scale = quantize_int8_per_channel(gate_up)
+            d_int8, d_scale = quantize_int8_per_channel(w_down)
+            self.w_gate_up_int8.copy_(gu_int8)
+            self.w_gate_up_scale.copy_(gu_scale)
+            self.w_down_int8.copy_(d_int8)
+            self.w_down_scale.copy_(d_scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -112,17 +142,25 @@ class SwiGLUMLP(nn.Module):
         Returns:
             (B, T, hidden_size)
         """
-        # --- 1. Fused gate + up projection (Level-2 fusion) ---
-        # ONE matmul produces both halves; split before the activation.
-        combined = F.linear(x, self.w_gate_up)        # (B, T, 2*intermediate_size)
-        gate, up = combined.chunk(2, dim=-1)          # each (B, T, intermediate_size)
+        if USE_TRITON and x.is_cuda:
+            from kernels.w8a16_gemm_kernel import w8a16_linear_triton
+            # --- 1. Fused gate + up projection (int8 weights) ---
+            combined = w8a16_linear_triton(
+                x, self.w_gate_up_int8, self.w_gate_up_scale
+            )                                              # (B, T, 2*intermediate)
+            gate, up = combined.chunk(2, dim=-1)
 
-        # --- 2. Fused silu(gate) * up (Section 14b — Level-1 fusion) ---
-        if USE_TRITON and gate.is_cuda:
+            # --- 2. Fused silu(gate) * up ---
             from kernels.swiglu_kernel import swiglu_triton
             fused = swiglu_triton(gate, up)
-        else:
-            fused = F.silu(gate) * up
 
-        # --- 3. Down projection (contract) ---
-        return F.linear(fused, self.w_down)
+            # --- 3. Down projection (int8 weights) ---
+            return w8a16_linear_triton(fused, self.w_down_int8, self.w_down_scale)
+
+        # Reference / CPU fallback: dequantize weights to x.dtype, then dense MLP.
+        w_gate_up = self.w_gate_up_int8.to(x.dtype) * self.w_gate_up_scale.to(x.dtype)[:, None]
+        w_down    = self.w_down_int8.to(x.dtype) * self.w_down_scale.to(x.dtype)[:, None]
+        combined = F.linear(x, w_gate_up)
+        gate, up = combined.chunk(2, dim=-1)
+        fused = F.silu(gate) * up
+        return F.linear(fused, w_down)
