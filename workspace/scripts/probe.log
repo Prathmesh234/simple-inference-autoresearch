@@ -1,0 +1,9 @@
+nohup: ignoring input
+Locating model: meta-llama/Llama-3.1-8B
+Fetching 14 files:   0%|          | 0/14 [00:00<?, ?it/s]Fetching 14 files: 100%|██████████| 14/14 [00:00<00:00, 175809.15it/s]
+Model directory: /home/ubuntu/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b
+  Found 291 tensors across 4 shards
+B=   1 Tprompt=  29 | full= 27.73ms  model= 27.52ms  sample=  0.65ms  (lm_head incl in model)
+B=  32 Tprompt=  29 | full= 29.44ms  model= 29.21ms  sample=  0.82ms  (lm_head incl in model)
+B=  64 Tprompt=  29 | full= 29.68ms  model= 28.08ms  sample=  1.75ms  (lm_head incl in model)
+B= 128 Tprompt=  29 | full= 30.91ms  model= 28.43ms  sample=  2.96ms  (lm_head incl in model)

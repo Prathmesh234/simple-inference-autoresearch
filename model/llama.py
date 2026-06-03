@@ -29,6 +29,8 @@ Parameter count sanity check
   Total:                 ~8.03B parameters
 """
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -38,6 +40,14 @@ from ops.embedding import TokenEmbedding, OutputProjection
 from ops.rmsnorm import RMSNorm
 from ops.rope import RopeFrequencies
 from model.block import TransformerBlock
+
+# CUDA-graph decode dispatch. The single-token (T==1) decode step is replayed
+# from a captured CUDA graph to strip the per-op CPU/profiler launch overhead
+# that dominates the profiled b128 headline (see model/cuda_graph_decode.py).
+# Set USE_CUDA_GRAPH=false to force the plain eager decode path (parity checks).
+USE_CUDA_GRAPH = os.environ.get("USE_CUDA_GRAPH", "true").lower() in (
+    "1", "true", "yes", "on",
+)
 
 
 class LlamaModel(nn.Module):
@@ -90,6 +100,10 @@ class LlamaModel(nn.Module):
         # lm_head weight loaded in load_weights().
         self.head = OutputProjection(self.embed, tied=cfg.tie_word_embeddings)
 
+        # Lazily-built CUDA-graph decode runner (rebuilt when the KV cache object
+        # or batch size changes). See _graph_decode below.
+        self._decoder = None
+
     def load_weights(self, loader: WeightLoader):
         """Load all weights from the checkpoint into this model."""
         dtype = self.cfg.model_dtype()
@@ -137,20 +151,63 @@ class LlamaModel(nn.Module):
         Returns:
             logits: (B, T, vocab_size)
         """
+        # Hot path: single-token decode replayed from a captured CUDA graph.
+        # Eligible only for T==1 decode with a KV cache, at a real decode
+        # position (start_pos>0 keeps single-token *prefill* on the eager path),
+        # on CUDA and under no_grad. Everything else uses the eager forward.
+        if (
+            USE_CUDA_GRAPH
+            and kv_cache is not None
+            and token_ids.dim() == 2
+            and token_ids.shape[1] == 1
+            and int(start_pos) > 0
+            and token_ids.is_cuda
+            and not torch.is_grad_enabled()
+        ):
+            return self._graph_decode(token_ids, int(start_pos), kv_cache)
+
         # 1. Embed tokens → residual stream
         x = self.embed(token_ids)                      # (B, T, hidden_size)
 
-        # 2. Pass through all 32 transformer blocks
+        # 2. Pass through all 32 transformer blocks, threading the residual
+        #    stream so each block's residual adds fold into the next RMSNorm
+        #    (no explicit elementwise add kernels — see TransformerBlock.forward).
+        residual = None
         for layer in self.layers:
-            x = layer(x, start_pos=start_pos, kv_cache=kv_cache)
+            x, residual = layer(x, residual, start_pos=start_pos, kv_cache=kv_cache)
 
-        # 3. Final layer norm
-        x = self.norm(x)                               # (B, T, hidden_size)
+        # 3. Final layer norm — folds the last block's pending residual add in.
+        x, _ = self.norm.add_norm(x, residual)         # (B, T, hidden_size)
 
         # 4. Project to vocabulary logits
         logits = self.head(x)                          # (B, T, vocab_size)
 
         return logits
+
+    def _graph_decode(self, token_ids, start_pos, kv_cache):
+        """Route a single-token decode step through the CUDA-graph runner.
+
+        Builds (and lazily captures) a CUDAGraphDecoder bound to this kv_cache
+        object and batch size. Identity is compared with ``is`` so a recycled
+        Python id() from a freed cache can never alias a stale graph. Capture
+        happens on the first eligible call (during the profiler's warmup) and
+        every later call is a single graph replay.
+        """
+        B = token_ids.shape[0]
+        dec = self._decoder
+        if dec is None or dec.kv_cache is not kv_cache or dec.B != B:
+            from model.cuda_graph_decode import CUDAGraphDecoder
+            dec = CUDAGraphDecoder(
+                self, kv_cache, B,
+                head_dim=self.cfg.head_dim,
+                max_seq_len=kv_cache.max_seq_len,
+                device=self.device,
+                dtype=self.cfg.model_dtype(),
+            )
+            self._decoder = dec
+        if not dec.captured:
+            dec.capture(start_pos)
+        return dec.decode_step(token_ids, start_pos)
 
     @classmethod
     def from_pretrained(

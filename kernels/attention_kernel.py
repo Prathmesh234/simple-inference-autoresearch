@@ -239,6 +239,7 @@ def attention_flash_triton(
     causal: bool,
     sm_scale: float | None = None,
     assume_contiguous: bool = False,
+    out_token_major: bool = False,
 ) -> torch.Tensor:
     """
     FlashAttention-2 forward in Triton. Drop-in for
@@ -256,8 +257,15 @@ def attention_flash_triton(
             that already guarantee contiguous inputs (e.g. the decode KV-cache
             path) can pass True to drop the per-call CPU check/copy. Leave False
             (default) when inputs may be views/transposed — correctness first.
+        out_token_major: if True, write the output in token-major layout
+            (B, Tq, Hq, D) instead of (B, Hq, Tq, D). The kernel indexes the
+            output with explicit strides, so this is free — and it lets the
+            caller `.view(B, Tq, Hq*D)` for the output projection WITHOUT a
+            transpose+contiguous copy (saves one copy kernel + HBM round-trip
+            per layer per step). The attention math is unchanged.
     Returns:
-        (B, Hq, Tq, D), same dtype as q
+        (B, Hq, Tq, D) by default, or (B, Tq, Hq, D) if out_token_major,
+        same dtype as q.
     """
     B, Hq, Tq, D = q.shape
     _, Hkv, Tk, _ = k.shape
@@ -269,7 +277,20 @@ def attention_flash_triton(
 
     if not assume_contiguous:
         q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
-    out = torch.empty_like(q)
+
+    if out_token_major:
+        # Allocate (B, Tq, Hq, D) and feed the kernel strides for the (b, hq, m, d)
+        # axes from this layout — the kernel writes to the right addresses with no
+        # extra copy.
+        out = torch.empty((B, Tq, Hq, D), dtype=q.dtype, device=q.device)
+        stride_ob, stride_om, stride_oh, stride_od = (
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        )
+    else:
+        out = torch.empty_like(q)
+        stride_ob, stride_oh, stride_om, stride_od = (
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        )
 
     grid = lambda meta: (triton.cdiv(Tq, meta["BLOCK_M"]), B * Hq)
     _flash_fwd[grid](
@@ -277,7 +298,7 @@ def attention_flash_triton(
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        stride_ob, stride_oh, stride_om, stride_od,
         Hq, Tq, Tk, KV_GROUP,
         D=D, CAUSAL=causal,
     )

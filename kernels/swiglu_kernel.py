@@ -88,7 +88,11 @@ def _swiglu_fwd(
      └───────────────────────────────┘
      ◄─────────── n_cols ────────────►
     """
-    row_pid = tl.program_id(0)
+    # 64-bit row index: for large prefill (n_rows = B*S up to ~1e5) the product
+    # row_pid * gu_row_stride (gu_row_stride = 2*n_cols ~ 28672) can exceed int32
+    # range (~2.9e9 > 2^31), wrapping to a negative address -> illegal memory
+    # access. Promote the row id to int64 before the pointer arithmetic.
+    row_pid = tl.program_id(0).to(tl.int64)
     col_pid = tl.program_id(1)
 
     g_ptr = gate_ptr + row_pid * gu_row_stride

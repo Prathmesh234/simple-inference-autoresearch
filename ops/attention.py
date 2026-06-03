@@ -100,21 +100,79 @@ class GroupedQueryAttention(nn.Module):
             self.wv.copy_(wv)
             self.wo.copy_(wo)
 
+    def _decode_graph_forward(self, x, kv_cache, ctx):
+        """CUDA-graph-capturable single-token (T==1) decode attention.
+
+        All ops have a fixed launch signature; the per-step position lives in
+        device buffers carried by ``ctx`` (filled by the decoder before each
+        graph replay), so a single captured graph serves every decode position:
+
+          - RoPE reads ctx.cos/ctx.sin — a static (1, head_dim) buffer holding
+            the cos/sin row for the current position (the existing RoPE kernel
+            sees seq_len==1, so every batch row maps to row 0).
+          - The new K/V are scattered into the preallocated cache at the current
+            slot via ``index_copy_`` along the sequence dim with ctx.pos_index
+            (a device LongTensor) — graph-safe because the slot is read from
+            device memory at replay time.
+          - Attention is FlashAttention (kernels/flash_decode_kernel) over the
+            FULL static cache, with the valid prefix length ctx.kv_len read from
+            a device scalar inside the kernel — keeping the fused flash path
+            (no SDPA mask fallback) while staying graph-safe.
+        """
+        B, T, _ = x.shape  # T == 1
+        q = F.linear(x, self.wq).view(B, T, self.num_heads_q,  self.head_dim)
+        k = F.linear(x, self.wk).view(B, T, self.num_heads_kv, self.head_dim)
+        v = F.linear(x, self.wv).view(B, T, self.num_heads_kv, self.head_dim)
+
+        q, k = apply_rope(q, k, ctx.cos, ctx.sin)
+
+        q = q.transpose(1, 2)  # (B, Hq,  1, D)
+        k = k.transpose(1, 2)  # (B, Hkv, 1, D)
+        v = v.transpose(1, 2)  # (B, Hkv, 1, D)
+
+        kc = kv_cache.k_cache[self.layer_idx, :B]  # (B, Hkv, S, D) view into pool
+        vc = kv_cache.v_cache[self.layer_idx, :B]
+        kc.index_copy_(2, ctx.pos_index, k)
+        vc.index_copy_(2, ctx.pos_index, v)
+
+        from kernels.flash_decode_kernel import attention_flash_decode
+        out = attention_flash_decode(q, kc, vc, ctx.kv_len)  # (B, 1, Hq, D)
+        out = out.reshape(B, T, self.num_heads_q * self.head_dim)
+        return F.linear(out, self.wo)
+
     def forward(
         self,
         x: torch.Tensor,
         start_pos: int = 0,
         kv_cache=None,
+        decode_ctx=None,
     ) -> torch.Tensor:
         """
         Args:
             x:         (B, T, hidden_size)
             start_pos: position offset — 0 during prefill, >0 during decode
             kv_cache:  optional KVCache object (Section 11) — None for now
+            decode_ctx: optional CUDA-graph decode context (see
+                       model/cuda_graph_decode.py). When provided, take the
+                       graph-capturable single-token decode path: position is
+                       read from device buffers (decode_ctx.cos/sin,
+                       decode_ctx.pos_index, decode_ctx.key_mask) instead of the
+                       Python int start_pos, the new K/V are written into the
+                       static cache with index_copy_ (a device-indexed scatter),
+                       and attention runs as SDPA over the full preallocated
+                       cache masked to the valid prefix. Every op here has a
+                       fixed launch signature, so the whole forward can be
+                       captured once into a CUDA graph and replayed per step —
+                       collapsing ~193 kernel launches into one graph launch and
+                       removing the per-op CPU/profiler dispatch overhead that
+                       dominates the profiled b128 headline.
 
         Returns:
             (B, T, hidden_size)
         """
+        if decode_ctx is not None:
+            return self._decode_graph_forward(x, kv_cache, decode_ctx)
+
         B, T, _ = x.shape
 
         # --- 1. Project to Q, K, V ---
@@ -128,9 +186,9 @@ class GroupedQueryAttention(nn.Module):
         v = v.view(B, T, self.num_heads_kv, self.head_dim)
 
         # --- 3. Apply RoPE to Q and K ---
-        cos, sin = self.rope_freqs.get(seq_len=T, start_pos=start_pos)
-        cos = cos.to(x.dtype)
-        sin = sin.to(x.dtype)
+        # Fetch cos/sin already in the activation dtype from RopeFrequencies'
+        # cached cast tables (avoids a per-layer, per-step .to(dtype) copy).
+        cos, sin = self.rope_freqs.get(seq_len=T, start_pos=start_pos, dtype=x.dtype)
         q, k = apply_rope(q, k, cos, sin)
 
         # --- 4. Transpose to (B, n_heads, T, head_dim) for SDPA ---
@@ -158,7 +216,20 @@ class GroupedQueryAttention(nn.Module):
 
         if USE_TRITON and q.is_cuda:
             from kernels.attention_kernel import attention_flash_triton
-            out = attention_flash_triton(q, k, v, causal=causal)
+            # q/k/v are strided views (q is transposed; k/v are KVCache prefix
+            # slices) but all have a contiguous head_dim, which is all the flash
+            # kernel needs — it indexes every dim with explicit strides. Passing
+            # assume_contiguous=True skips a per-step .contiguous() copy of the
+            # whole K/V prefix (heavy HBM traffic + peak VRAM for long contexts).
+            # out_token_major=True writes the result directly as (B, T, Hq, D),
+            # so we can view it straight into (B, T, hidden) for the output
+            # projection — no transpose+contiguous copy per layer per step.
+            out = attention_flash_triton(
+                q, k, v, causal=causal,
+                assume_contiguous=True, out_token_major=True,
+            )
+            # out: (B, T, n_heads_q, head_dim) contiguous → view to (B, T, hidden)
+            out = out.view(B, T, self.num_heads_q * self.head_dim)
         else:
             if self.num_kv_groups > 1:
                 k = k.repeat_interleave(self.num_kv_groups, dim=1)
@@ -169,11 +240,11 @@ class GroupedQueryAttention(nn.Module):
                 dropout_p=0.0,
                 is_causal=causal,
             )
-        # out: (B, n_heads_q, T, head_dim)
+            # out: (B, n_heads_q, T, head_dim) → merge heads
+            out = out.transpose(1, 2).contiguous()       # (B, T, n_heads_q, head_dim)
+            out = out.view(B, T, self.num_heads_q * self.head_dim)  # (B, T, hidden)
 
-        # --- 8. Merge heads and project output ---
-        out = out.transpose(1, 2).contiguous()       # (B, T, n_heads_q, head_dim)
-        out = out.view(B, T, self.num_heads_q * self.head_dim)  # (B, T, hidden)
+        # --- 8. Output projection ---
         out = F.linear(out, self.wo)                 # (B, T, hidden)
 
         return out
