@@ -336,3 +336,78 @@ require **fewer weight BYTES** (int4 numerics dead via RTN) or packing more sequ
 2. INT4 W4A16 *with calibration* (AWQ/GPTQ) for gate_up only — the one >96MB HBM-bound op.
    High effort + faithfulness risk; only if #1 is exhausted.
 3. Reduce ~10 eager per-step ops outside the graph (small, profiler-CPU-overhead only).
+
+## EXP-H — retune W8A8 gate_up + lm_head tiles (commit b138eea) — DISCARD
+Min-of-many standalone sweeps found faster configs (numerically identical):
+gate_up _w8a8_swiglu_fwd BLOCK_K 128->256 nw 4->8 (157->149us, 1.05x); lm_head
+_w8a8_gemm (128,128,128,2,4)->(128,256,256,2,8) (684->656us, 1.04x).
+BUT the full-engine A/B did NOT confirm: isolated EXP-H [7446,7091,7472] vs EXP-G
+[7340,7389,7552] overlap heavily (EXP-G mean higher); full sweep 6718.8 < EXP-G
+6804.7. The ~1.5% standalone micro-win is below this window's profiler noise and
+the wider tiles may add register/SMEM pressure in the full captured graph.
+-> DISCARD (git reset --hard ed884c8). LESSON: standalone min-bench wins on
+non-dominant kernels can vanish in the full engine; always confirm with the
+profiler A/B and discard if it doesn't separate.
+
+## EXP-I — INT4 weight on gate_up / lm_head (investigation) — DEAD (no commit)
+Tested 4-bit (grouped RTN, group=32/64/128) on the two genuinely HBM-bound decode
+weights to see if cutting weight bytes below the 96MB L2 helps.
+- **Key realization first**: b128 decode is **compute/MMA-bound, NOT bandwidth-bound**.
+  ~28ms/step moves ~8GB int8 weights = ~280 GB/s effective, far below 960 GB/s HBM.
+  So "fewer weight bytes" (int4) cannot help at b128 except where a weight exceeds L2
+  and forces HBM traffic — only gate_up (117MB int8) and lm_head (525MB) qualify.
+- **int4 gate_up (117->58MB, would fit L2)**: faithfulness DEAD. Through 32 layers of
+  nonlinear SwiGLU the RTN error compounds: final-logit rel_err ~0.22-0.26, argmax only
+  0.83, top5 ~0.70 (g=32..128). Confirms the prior INT4-RTN "coherence dead" for
+  transformer-block weights. Would need AWQ/GPTQ calibration (huge effort, still risky).
+- **int4 lm_head (525->263MB)**: faithfulness OK for greedy (single final projection, no
+  compounding): argmax 1.000, top1 1.000, top5 0.867, top50 0.79-0.86. BUT lm_head is only
+  ~3% of decode (already W8A8) -> halving its bytes is ~1.2% headline = SUB-NOISE (EXP-H
+  lesson: sub-2% washes out in the full engine). Plus top5 0.867 adds sampling-faithfulness
+  risk and needs a new W4A8 (b128) + W4A16 (b1) packed/unpack kernel. Not worth it.
+  (Could revisit ONLY as a b1-latency/VRAM play, which is a secondary frontier metric.)
+-> Both DEAD for the b128 aggregate headline. The decode path's bandwidth tricks are
+   exhausted; remaining levers must be COMPUTE/MMA-side, and W8A8 is already on every
+   GEMM where it's faithful + faster (gate_up, lm_head). qkv/down/o_proj W8A8 stay dead.
+
+## EXP-J — W8A8 int8-tensor-core qkv decode GEMM (free quant via attn_norm) — KEEP
+The decode qkv projection (fused q+k+v, N=6144, K=4096) was the last big GEMM still
+on weight-only W8A16. Prior sessions had marked "qkv W8A8 dead (0.976x GEMM-only,
+0.465x self-quant)" — but that used the DEFAULT (128,128,128) tile. Re-tuning (same
+"wrong shared tile" lesson as EXP-G) found BLOCK_N=64 (BM128,BK128,st3,nw8) runs the
+int8 qkv GEMM at 22us vs 49us for the EXP-G-tuned W8A16 = **2.24x**. The standalone
+_quant_per_token launch is the killer (self-quant e2e 0.655x), so — like EXP-D for
+gate_up — the per-token int8 quant is fused for FREE into the preceding attn_norm
+(add_norm_quant), and the W8A8 qkv GEMM consumes it directly.
+Wiring: model/block.py attn_norm later-blocks -> add_norm_quant (emits int8+scale);
+first block (residual=None) stays W8A16 (1/32 layers). ops/attention.py threads
+x_int8/x_scale through forward -> _decode_graph_forward -> _project_qkv, which
+dispatches W8A8 for 16<M<=256 (b128 decode) and W8A16 for M<=16 (b1) / M>256 (prefill).
+New kernels/w8a8_gemm_kernel.py:w8a8_qkv_prequant (hardcoded tuned tile, graph-safe,
+shape asserts). Reuses the existing per-channel int8 qkv weight buffers (no extra VRAM).
+Faithfulness (clean isolation, same bf16 normed act): decode-shape rel_err 0.0045 /
+cos 0.99996 (10x better than the accepted gate_up W8A8 ~0.06); 32-tok greedy match
+0.828 (> accepted gate_up EXP-C 0.79); coherent output; 256-tok divergences are
+base-model greedy-degeneracy (repetition attractors), not quant garbage.
+Speed: ISO b128 A/B (same thermal window) NEW [7746.6,7706.4] vs BASE-ed884c8
+[7453.0,7405.0] = +4.0% PERFECT SEPARATION (min>max). Full sweep 7008.7 vs same-window
+ed884c8 confirmation 6660.2 = +5.2% (vs recorded 6804.7 = +3.0%). b1 neutral (94.8),
+VRAM unchanged (38.53). KEEP. Cumulative vs baseline cd35f29 (5024.6): +39.5%.
+
+## EXP-K — o_proj W8A8 (investigation) — DEAD (no commit)
+o_proj (N=4096,K=4096) is bf16 cuBLAS today; prior "int8 0.56x dead" used the default
+tile. Re-tuned int8 tile (BLOCK_N=32,BK=256,st3,nw4) GEMM-only = 22.25us vs cuBLAS
+28.83us = 1.30x, and faithful (rel_err 0.0070, attention-output is bounded). BUT the
+win needs FREE activation quant, which o_proj cannot get:
+- Standalone _quant_per_token at M=128,K=4096 = 21us (occupancy-starved: 128 programs
+  on 142 SMs, each a serial 4096-wide reduction) -> W8A8 e2e 45.8us = 0.63x (LOSES).
+- torch-op quant (amax+div+round+cast) = 87us (many launches) = 0.21x. Worse.
+- Free quant is STRUCTURALLY BLOCKED: o_proj's per-token scale spans all Hq*D=4096
+  dims, but flash_decode's per-(B,head) programs each only see D=128 -> cannot compute
+  the per-row amax. A per-head-group-scale W8A8 GEMM + int8-emitting flash_decode could
+  work but is a large, risky redesign for a 6.75% op.
+-> DEAD. GENERAL PRINCIPLE established: a decode GEMM can only go W8A8 if its input
+   comes from a kernel already doing a per-row pass (a NORM) that yields the int8 quant
+   for free. gate_up/qkv/lm_head (norm inputs) are all W8A8 now; down (swiglu-output
+   outliers, faithfulness rel_err~26) and o_proj (attention output, cross-head scale)
+   are blocked. The decode GEMM W8A8 conversion is COMPLETE.
