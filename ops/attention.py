@@ -128,9 +128,9 @@ class GroupedQueryAttention(nn.Module):
         v = v.view(B, T, self.num_heads_kv, self.head_dim)
 
         # --- 3. Apply RoPE to Q and K ---
-        cos, sin = self.rope_freqs.get(seq_len=T, start_pos=start_pos)
-        cos = cos.to(x.dtype)
-        sin = sin.to(x.dtype)
+        # Fetch cos/sin already in the activation dtype from RopeFrequencies'
+        # cached cast tables (avoids a per-layer, per-step .to(dtype) copy).
+        cos, sin = self.rope_freqs.get(seq_len=T, start_pos=start_pos, dtype=x.dtype)
         q, k = apply_rope(q, k, cos, sin)
 
         # --- 4. Transpose to (B, n_heads, T, head_dim) for SDPA ---

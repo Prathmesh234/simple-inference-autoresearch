@@ -113,9 +113,17 @@ class RopeFrequencies:
         # pair (d0, d1) both use the same angle θ_i
         angles = torch.cat([angles, angles], dim=-1)  # (max_seq_len, head_dim)
 
-        # Store as float32 — we cast to bfloat16 at application time
+        # Store as float32 — we cast to the compute dtype at application time
         self.cos = angles.cos()  # (max_seq_len, head_dim)
         self.sin = angles.sin()  # (max_seq_len, head_dim)
+
+        # Lazy per-dtype cast cache. The cos/sin tables are constant for the
+        # whole run, but attention needs them in the activation dtype (bf16).
+        # Casting the FULL table once and slicing is bit-identical to slicing
+        # then casting (cast is elementwise), and it removes a tiny per-layer,
+        # per-step `.to(dtype)` copy kernel — 2 per layer x 32 layers = 64 tiny
+        # launches eliminated from every decode step.
+        self._cast_cache: dict[torch.dtype, tuple[torch.Tensor, torch.Tensor]] = {}
 
     @staticmethod
     def _apply_llama3_scaling(
@@ -154,13 +162,26 @@ class RopeFrequencies:
 
         return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
-    def get(self, seq_len: int, start_pos: int = 0):
+    def get(self, seq_len: int, start_pos: int = 0, dtype: torch.dtype | None = None):
         """
         Return (cos, sin) slices for positions [start_pos, start_pos + seq_len).
         start_pos is non-zero during decode (we're at position > 0 in the sequence).
+
+        If `dtype` is given, the slices are returned already cast to that dtype
+        using a cached full-table cast (bit-identical to slicing the float32
+        table then casting, but without a per-call copy kernel). With
+        `dtype=None` the raw float32 tables are sliced (legacy behaviour).
         """
-        cos = self.cos[start_pos : start_pos + seq_len]  # (seq_len, head_dim)
-        sin = self.sin[start_pos : start_pos + seq_len]
+        if dtype is None or dtype == torch.float32:
+            cos_tbl, sin_tbl = self.cos, self.sin
+        else:
+            cached = self._cast_cache.get(dtype)
+            if cached is None:
+                cached = (self.cos.to(dtype), self.sin.to(dtype))
+                self._cast_cache[dtype] = cached
+            cos_tbl, sin_tbl = cached
+        cos = cos_tbl[start_pos : start_pos + seq_len]  # (seq_len, head_dim)
+        sin = sin_tbl[start_pos : start_pos + seq_len]
         return cos, sin
 
 
