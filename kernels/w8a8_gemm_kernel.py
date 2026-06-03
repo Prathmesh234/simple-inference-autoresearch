@@ -281,3 +281,49 @@ def w8a8_linear_prequant(
         num_stages=num_stages, num_warps=num_warps,
     )
     return y.reshape(*orig_shape[:-1], N)
+
+
+def w8a8_qkv_prequant(
+    x_int8: torch.Tensor,
+    act_scale: torch.Tensor,
+    w_int8: torch.Tensor,
+    w_scale: torch.Tensor,
+    orig_shape,
+) -> torch.Tensor:
+    """W8A8 fused-qkv GEMM with the activation ALREADY int8-quantized per-token.
+
+    The decode qkv projection (fused q+k+v, N=6144, K=4096) was previously left on
+    the weight-only W8A16 path because a *self-quantizing* W8A8 lost (the standalone
+    _quant_per_token launch costs more than the GEMM saves). Here the int8 normed
+    activation + per-row scale come for free from the preceding fused
+    ``attn_norm.add_norm_quant`` (the EXP-D trick), so only the GEMM remains.
+
+    At the b128 decode shape (M=128) the int8 GEMM needs its OWN tile: BLOCK_N=64
+    (num_stages=3, num_warps=8) runs at 22us vs 49us for the EXP-G-tuned W8A16
+    (2.2x). The default (128,128,128) tile — what the earlier "qkv W8A8 is dead"
+    conclusion used — is ~2x slower at this N=6144 shape (same "wrong tile" lesson
+    as EXP-G). Tile is hardcoded (no autotune) so the static-shape decode path
+    replays inside the captured CUDA graph.
+
+    Caller (ops/attention._project_qkv) owns the M-bucket dispatch: this is only
+    invoked for 16 < M <= 256, with the bf16 W8A16 fallback used outside that range.
+    """
+    M, K = x_int8.shape
+    N = w_int8.shape[0]
+    assert x_int8.is_contiguous(), "qkv W8A8 expects contiguous int8 activations"
+    assert K % 128 == 0 and N % 64 == 0, f"qkv W8A8 tile assumes K%128==0, N%64==0 (got K={K}, N={N})"
+    assert act_scale.shape == (M,), f"act_scale must be (M,), got {tuple(act_scale.shape)}"
+    y = torch.empty((M, N), dtype=torch.bfloat16, device=x_int8.device)
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 128
+    num_stages, num_warps = 3, 8
+    GROUP_M = 8
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    _w8a8_gemm[grid](
+        x_int8, w_int8, act_scale, w_scale, y, M, N, K,
+        x_int8.stride(0), x_int8.stride(1),
+        w_int8.stride(0), w_int8.stride(1),
+        y.stride(0), y.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=GROUP_M,
+        num_stages=num_stages, num_warps=num_warps,
+    )
+    return y.reshape(*orig_shape[:-1], N)

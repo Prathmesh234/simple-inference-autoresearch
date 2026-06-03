@@ -124,16 +124,31 @@ class GroupedQueryAttention(nn.Module):
             self.w_qkv_scale.copy_(qkv_scale)
             self.wo.copy_(wo)
 
-    def _project_qkv(self, x, B, T):
+    def _project_qkv(self, x, B, T, x_int8=None, x_scale=None):
         """Fused int8 qkv projection → (q, k, v) reshaped into heads.
 
         Returns q (B,T,Hq,D), k (B,T,Hkv,D), v (B,T,Hkv,D). The last-dim slices of
         the contiguous (B,T,6144) output are split into heads with reshape (a view,
         no copy, since only the contiguous final dim is split).
+
+        When ``x_int8``/``x_scale`` are provided (the per-token int8 quant of the
+        normed activation, emitted for free by the preceding fused
+        ``attn_norm.add_norm_quant``) and M = B*T is in the W8A8 decode bucket
+        (16 < M <= 256), the projection runs as a true int8 tensor-core GEMM
+        (~2.2x over W8A16 at the b128 decode shape). Outside that bucket — b1
+        decode (M<=16, latency-bound) and prefill (M>256) — it falls back to the
+        weight-only W8A16 path on the bf16 activation.
         """
         if USE_TRITON and x.is_cuda:
-            from kernels.w8a16_gemm_kernel import w8a16_linear_triton
-            qkv = w8a16_linear_triton(x, self.w_qkv_int8, self.w_qkv_scale)
+            M = B * T
+            if x_int8 is not None and 16 < M <= 256:
+                from kernels.w8a8_gemm_kernel import w8a8_qkv_prequant
+                qkv = w8a8_qkv_prequant(
+                    x_int8, x_scale, self.w_qkv_int8, self.w_qkv_scale, x.shape
+                )
+            else:
+                from kernels.w8a16_gemm_kernel import w8a16_linear_triton
+                qkv = w8a16_linear_triton(x, self.w_qkv_int8, self.w_qkv_scale)
         else:
             w_qkv = self.w_qkv_int8.to(x.dtype) * self.w_qkv_scale.to(x.dtype)[:, None]
             qkv = F.linear(x, w_qkv)
@@ -144,7 +159,7 @@ class GroupedQueryAttention(nn.Module):
             B, T, self.num_heads_kv, self.head_dim)
         return q, k, v
 
-    def _decode_graph_forward(self, x, kv_cache, ctx):
+    def _decode_graph_forward(self, x, kv_cache, ctx, x_int8=None, x_scale=None):
         """CUDA-graph-capturable single-token (T==1) decode attention.
 
         All ops have a fixed launch signature; the per-step position lives in
@@ -164,7 +179,7 @@ class GroupedQueryAttention(nn.Module):
             (no SDPA mask fallback) while staying graph-safe.
         """
         B, T, _ = x.shape  # T == 1
-        q, k, v = self._project_qkv(x, B, T)
+        q, k, v = self._project_qkv(x, B, T, x_int8=x_int8, x_scale=x_scale)
 
         q, k = apply_rope(q, k, ctx.cos, ctx.sin)
 
@@ -188,6 +203,8 @@ class GroupedQueryAttention(nn.Module):
         start_pos: int = 0,
         kv_cache=None,
         decode_ctx=None,
+        x_int8: torch.Tensor | None = None,
+        x_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -213,12 +230,13 @@ class GroupedQueryAttention(nn.Module):
             (B, T, hidden_size)
         """
         if decode_ctx is not None:
-            return self._decode_graph_forward(x, kv_cache, decode_ctx)
+            return self._decode_graph_forward(x, kv_cache, decode_ctx,
+                                              x_int8=x_int8, x_scale=x_scale)
 
         B, T, _ = x.shape
 
         # --- 1. Project to Q, K, V (fused int8 GEMM) + reshape into heads ---
-        q, k, v = self._project_qkv(x, B, T)
+        q, k, v = self._project_qkv(x, B, T, x_int8=x_int8, x_scale=x_scale)
 
         # --- 3. Apply RoPE to Q and K ---
         # Fetch cos/sin already in the activation dtype from RopeFrequencies'

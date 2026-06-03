@@ -146,14 +146,19 @@ class TransformerBlock(nn.Module):
             stream after the attention add.
         """
         # --- 1. Attention block ---
-        # First block: no pending add, just normalize and seed the residual.
-        # Later blocks: residual += x (previous mlp out), then normalize.
+        # First block: no pending add, just normalize and seed the residual (kept
+        # on the W8A16 qkv path — one of 32 layers, not worth a residual-less
+        # quant kernel). Later blocks: fold residual += x into the norm AND emit
+        # the per-token int8 quant of the normed output for free (EXP-D pattern),
+        # so the W8A8 qkv GEMM runs with no standalone activation-quant launch.
         if residual is None:
             residual = x
             h = self.attn_norm(x)
+            h_int8, h_scale = None, None
         else:
-            h, residual = self.attn_norm.add_norm(x, residual)
-        h = self.attn(h, start_pos=start_pos, kv_cache=kv_cache, decode_ctx=decode_ctx)
+            h, residual, h_int8, h_scale = self.attn_norm.add_norm_quant(x, residual)
+        h = self.attn(h, start_pos=start_pos, kv_cache=kv_cache,
+                      decode_ctx=decode_ctx, x_int8=h_int8, x_scale=h_scale)
 
         # --- 2. MLP block ---
         # Fold the attention residual add into the pre-MLP norm, and (EXP-D)
