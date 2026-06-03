@@ -58,8 +58,8 @@ def main():
     torch.cuda.synchronize()
     sweep_ms = (time.perf_counter() - t0) * 1000
 
-    from kernels.rope_kernel import _rope_fwd
-    chosen = next(iter(_rope_fwd.cache.values()))
+    from kernels.rope_kernel import _rope_qk_fwd
+    chosen = next(iter(_rope_qk_fwd.cache.values()))
     print(f"  Autotune sweep took {sweep_ms:.0f} ms  (cached → free thereafter)")
     print(f"  Selected config: num_warps={chosen.num_warps}, num_stages={chosen.num_stages}")
 

@@ -80,15 +80,18 @@ import triton.language as tl
         triton.Config({}, num_warps=2, num_stages=3),
         triton.Config({}, num_warps=4, num_stages=3),
     ],
-    key=["n_heads", "HALF", "INTERLEAVED"],
+    key=["HALF", "INTERLEAVED"],
 )
 @triton.jit
-def _rope_fwd(
-    x_ptr,        # input  (n_tokens, n_heads, head_dim) contiguous
+def _rope_qk_fwd(
+    q_ptr,        # input  Q (n_tokens, n_heads_q,  head_dim) contiguous
+    k_ptr,        # input  K (n_tokens, n_heads_kv, head_dim) contiguous
     cos_ptr,      # cos    (seq_len, cos_row_stride) — only first HALF used
     sin_ptr,      # sin    same layout as cos
-    out_ptr,      # output (n_tokens, n_heads, head_dim) contiguous
-    n_heads,
+    q_out_ptr,    # output Q (n_tokens, n_heads_q,  head_dim) contiguous
+    k_out_ptr,    # output K (n_tokens, n_heads_kv, head_dim) contiguous
+    n_heads_q: tl.constexpr,
+    n_heads_kv: tl.constexpr,
     seq_len,
     cos_row_stride,  # stride between cos rows (HALF for raw, head_dim for HF duplicated)
     HEAD_DIM: tl.constexpr,
@@ -97,29 +100,23 @@ def _rope_fwd(
     INTERLEAVED: tl.constexpr,       # False = Llama/NEOX, True = GPT-J style
 ):
     """
-    One program per (token, head). Processes both halves of the rotation in
-    a single pass — no rotate_half materialization.
+    One program per (token, head) across BOTH Q and K in a single launch.
 
-    NEOX (Llama) layout:
-        Pairs are (x[..., i], x[..., i + HALF]).
-        out[i]        = x[i]        * cos[i] - x[i + HALF] * sin[i]
-        out[i + HALF] = x[i + HALF] * cos[i] + x[i]        * sin[i]
+    The grid second dim ranges over n_heads_q + n_heads_kv: program columns
+    [0, n_heads_q) rotate Q heads, columns [n_heads_q, n_heads_q+n_heads_kv)
+    rotate K heads. This fuses what used to be two separate kernel launches
+    (one for Q, one for K) into one — halving RoPE launches per decode step.
 
-    Interleaved (GPT-J) layout:
-        Pairs are (x[..., 2i], x[..., 2i + 1]).
-        out[2i]     = x[2i]     * cos[i] - x[2i + 1] * sin[i]
-        out[2i + 1] = x[2i + 1] * cos[i] + x[2i]     * sin[i]
+    The rotation math is identical to the per-tensor kernel (float32 compute,
+    store back in the input dtype), so output is bit-identical.
     """
     row_pid = tl.program_id(0)       # one row = one token (B*T flattened)
-    col_pid = tl.program_id(1)       # one col = one head
+    col_pid = tl.program_id(1)       # head index across Q heads then K heads
 
     # Position within the passed cos/sin window. Assumes every batch element
-    # shares the same positional range, which is true for prefill and for
-    # decode where T=1 (then this is always 0).
+    # shares the same positional range (true for prefill and for decode T=1).
     seq_pos = row_pid % seq_len
-
-    head_base = (row_pid * n_heads + col_pid) * HEAD_DIM
-    cs_base   = seq_pos * cos_row_stride
+    cs_base = seq_pos * cos_row_stride
 
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < HALF
@@ -127,24 +124,37 @@ def _rope_fwd(
     cos = tl.load(cos_ptr + cs_base + cols, mask=mask, other=0.0).to(tl.float32)
     sin = tl.load(sin_ptr + cs_base + cols, mask=mask, other=0.0).to(tl.float32)
 
-    if INTERLEAVED:
-        # Adjacent pairs: stride-2 access into the head vector
-        offs_a = head_base + 2 * cols
-        offs_b = offs_a + 1
+    out_dtype = q_ptr.dtype.element_ty  # q and k share dtype; hoist out of branches
+
+    if col_pid < n_heads_q:
+        head_base = (row_pid * n_heads_q + col_pid) * HEAD_DIM
+        if INTERLEAVED:
+            offs_a = head_base + 2 * cols
+            offs_b = offs_a + 1
+        else:
+            offs_a = head_base + cols
+            offs_b = offs_a + HALF
+        x_a = tl.load(q_ptr + offs_a, mask=mask, other=0.0).to(tl.float32)
+        x_b = tl.load(q_ptr + offs_b, mask=mask, other=0.0).to(tl.float32)
+        out_a = x_a * cos - x_b * sin
+        out_b = x_b * cos + x_a * sin
+        tl.store(q_out_ptr + offs_a, out_a.to(out_dtype), mask=mask)
+        tl.store(q_out_ptr + offs_b, out_b.to(out_dtype), mask=mask)
     else:
-        # NEOX / Llama split-half pairs
-        offs_a = head_base + cols
-        offs_b = offs_a + HALF
-
-    x_a = tl.load(x_ptr + offs_a, mask=mask, other=0.0).to(tl.float32)
-    x_b = tl.load(x_ptr + offs_b, mask=mask, other=0.0).to(tl.float32)
-
-    out_a = x_a * cos - x_b * sin
-    out_b = x_b * cos + x_a * sin
-
-    out_dtype = x_ptr.dtype.element_ty
-    tl.store(out_ptr + offs_a, out_a.to(out_dtype), mask=mask)
-    tl.store(out_ptr + offs_b, out_b.to(out_dtype), mask=mask)
+        head = col_pid - n_heads_q
+        head_base = (row_pid * n_heads_kv + head) * HEAD_DIM
+        if INTERLEAVED:
+            offs_a = head_base + 2 * cols
+            offs_b = offs_a + 1
+        else:
+            offs_a = head_base + cols
+            offs_b = offs_a + HALF
+        x_a = tl.load(k_ptr + offs_a, mask=mask, other=0.0).to(tl.float32)
+        x_b = tl.load(k_ptr + offs_b, mask=mask, other=0.0).to(tl.float32)
+        out_a = x_a * cos - x_b * sin
+        out_b = x_b * cos + x_a * sin
+        tl.store(k_out_ptr + offs_a, out_a.to(out_dtype), mask=mask)
+        tl.store(k_out_ptr + offs_b, out_b.to(out_dtype), mask=mask)
 
 
 def _check_cos_sin(cos: torch.Tensor, sin: torch.Tensor, head_dim: int) -> int:
@@ -173,30 +183,37 @@ def _check_cos_sin(cos: torch.Tensor, sin: torch.Tensor, head_dim: int) -> int:
     return cos.stride(0)
 
 
-def _apply_one(
-    x: torch.Tensor,
+def _apply_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     cos_row_stride: int,
     interleaved: bool,
-) -> torch.Tensor:
-    """Apply RoPE to a single (B, T, n_heads, head_dim) tensor."""
-    B, T, n_heads, head_dim = x.shape
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE to Q and K in a single fused kernel launch."""
+    B, T, n_heads_q, head_dim = q.shape
     assert head_dim % 2 == 0, "head_dim must be even for RoPE"
+    assert k.shape[0] == B and k.shape[1] == T and k.shape[3] == head_dim
+    n_heads_kv = k.shape[2]
     seq_len = cos.shape[0]
     assert sin.shape[0] == seq_len
 
-    x   = x.contiguous()
-    out = torch.empty_like(x)
+    q = q.contiguous()
+    k = k.contiguous()
+    q_out = torch.empty_like(q)
+    k_out = torch.empty_like(k)
 
     n_tokens   = B * T
     HALF       = head_dim // 2
     BLOCK_SIZE = triton.next_power_of_2(HALF)
 
-    grid = (n_tokens, n_heads)
-    _rope_fwd[grid](
-        x, cos, sin, out,
-        n_heads,
+    # Grid covers every (token, head) across BOTH Q and K heads in one launch.
+    grid = (n_tokens, n_heads_q + n_heads_kv)
+    _rope_qk_fwd[grid](
+        q, k, cos, sin, q_out, k_out,
+        n_heads_q,
+        n_heads_kv,
         seq_len,
         cos_row_stride,
         HEAD_DIM=head_dim,
@@ -204,7 +221,7 @@ def _apply_one(
         BLOCK_SIZE=BLOCK_SIZE,
         INTERLEAVED=interleaved,
     )
-    return out
+    return q_out, k_out
 
 
 def rope_triton(
@@ -231,6 +248,4 @@ def rope_triton(
     """
     head_dim = q.shape[-1]
     cos_row_stride = _check_cos_sin(cos, sin, head_dim)
-    q_rot = _apply_one(q, cos, sin, cos_row_stride, interleaved)
-    k_rot = _apply_one(k, cos, sin, cos_row_stride, interleaved)
-    return q_rot, k_rot
+    return _apply_qk(q, k, cos, sin, cos_row_stride, interleaved)
