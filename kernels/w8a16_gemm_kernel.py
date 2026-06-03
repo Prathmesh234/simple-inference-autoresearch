@@ -94,7 +94,11 @@ def _w8a16_gemm(
     acc = acc * scale[None, :]
 
     offs_ym = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    y_ptrs = y_ptr + offs_ym[:, None] * stride_ym + offs_yn[None, :] * stride_yn
+    # 64-bit row offset: for large prefill M the product offs_ym*stride_ym (= M*N)
+    # can exceed int32 range (e.g. M~1e5, N=28672 -> ~3e9 > 2^31), which would wrap
+    # to a negative address and trigger an illegal memory access. Promote to int64.
+    y_ptrs = (y_ptr + offs_ym[:, None].to(tl.int64) * stride_ym
+              + offs_yn[None, :].to(tl.int64) * stride_yn)
     y_mask = (offs_ym[:, None] < M) & (offs_yn[None, :] < N)
     tl.store(y_ptrs, acc.to(y_ptr.dtype.element_ty), mask=y_mask)
 
