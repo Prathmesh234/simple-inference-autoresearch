@@ -161,11 +161,17 @@ def w8a16_linear_triton(
         BLOCK_M, BLOCK_N, BLOCK_K = 16, 128, 128
         num_stages, num_warps = 4, 8
     elif M <= 256:
-        # b128 decode: the two MLP shapes want different BLOCK_M, so select by N.
-        # tuner best: gate_up (N=28672) -> (128,128,128,2,4); down (N=4096) -> (32,128,128,3,8).
+        # b128 decode: qkv (N=6144) and down (N=4096) share this bucket but want
+        # different tiles. gate_up/lm_head are W8A8 at this M so they no longer
+        # reach the W8A16 path here; the N>=8192 branch is kept as a safe fallback.
+        # tuner best (min-of-many, clock-noise-free): qkv -> (128,64,128,3,4) =
+        # 1.14x over the down tile (42.2 vs 48.2us); down (N=4096) -> (32,128,128,3,8).
         if N >= 8192:
             BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 128
             num_stages, num_warps = 2, 4
+        elif N >= 6144:
+            BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 128
+            num_stages, num_warps = 3, 4
         else:
             BLOCK_M, BLOCK_N, BLOCK_K = 32, 128, 128
             num_stages, num_warps = 3, 8
