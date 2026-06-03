@@ -163,7 +163,15 @@ class GroupedQueryAttention(nn.Module):
             # kernel needs — it indexes every dim with explicit strides. Passing
             # assume_contiguous=True skips a per-step .contiguous() copy of the
             # whole K/V prefix (heavy HBM traffic + peak VRAM for long contexts).
-            out = attention_flash_triton(q, k, v, causal=causal, assume_contiguous=True)
+            # out_token_major=True writes the result directly as (B, T, Hq, D),
+            # so we can view it straight into (B, T, hidden) for the output
+            # projection — no transpose+contiguous copy per layer per step.
+            out = attention_flash_triton(
+                q, k, v, causal=causal,
+                assume_contiguous=True, out_token_major=True,
+            )
+            # out: (B, T, n_heads_q, head_dim) contiguous → view to (B, T, hidden)
+            out = out.view(B, T, self.num_heads_q * self.head_dim)
         else:
             if self.num_kv_groups > 1:
                 k = k.repeat_interleave(self.num_kv_groups, dim=1)
@@ -174,11 +182,11 @@ class GroupedQueryAttention(nn.Module):
                 dropout_p=0.0,
                 is_causal=causal,
             )
-        # out: (B, n_heads_q, T, head_dim)
+            # out: (B, n_heads_q, T, head_dim) → merge heads
+            out = out.transpose(1, 2).contiguous()       # (B, T, n_heads_q, head_dim)
+            out = out.view(B, T, self.num_heads_q * self.head_dim)  # (B, T, hidden)
 
-        # --- 8. Merge heads and project output ---
-        out = out.transpose(1, 2).contiguous()       # (B, T, n_heads_q, head_dim)
-        out = out.view(B, T, self.num_heads_q * self.head_dim)  # (B, T, hidden)
+        # --- 8. Output projection ---
         out = F.linear(out, self.wo)                 # (B, T, hidden)
 
         return out
