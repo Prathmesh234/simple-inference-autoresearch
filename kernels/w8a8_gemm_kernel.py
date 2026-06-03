@@ -140,7 +140,7 @@ def w8a8_linear_triton(
     xs = torch.empty((M,), dtype=torch.float32, device=x.device)
     _quant_per_token[(M,)](
         x2d, xi, xs, M, K, x2d.stride(0), x2d.stride(1),
-        BLOCK_K=triton.next_power_of_2(K), num_warps=8,
+        BLOCK_K=triton.next_power_of_2(K), num_warps=4,
     )
 
     y = torch.empty((M, N), dtype=x.dtype, device=x.device)
@@ -151,6 +151,37 @@ def w8a8_linear_triton(
     _w8a8_gemm[grid](
         xi, w_int8, xs, scale, y, M, N, K,
         xi.stride(0), xi.stride(1),
+        w_int8.stride(0), w_int8.stride(1),
+        y.stride(0), y.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=GROUP_M,
+        num_stages=num_stages, num_warps=num_warps,
+    )
+    return y.reshape(*orig_shape[:-1], N)
+
+
+def w8a8_linear_prequant(
+    x_int8: torch.Tensor,
+    act_scale: torch.Tensor,
+    w_int8: torch.Tensor,
+    w_scale: torch.Tensor,
+    orig_shape,
+) -> torch.Tensor:
+    """W8A8 GEMM when the activation is ALREADY int8-quantized (per-token).
+
+    Used by the EXP-D path where the preceding fused add_rmsnorm emits the int8
+    normed output + per-row scale, so the standalone _quant_per_token launch is
+    skipped. x_int8 is (M, K) int8, act_scale is (M,) fp32.
+    """
+    M, K = x_int8.shape
+    N = w_int8.shape[0]
+    y = torch.empty((M, N), dtype=torch.bfloat16, device=x_int8.device)
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 128
+    num_stages, num_warps = 2, 4
+    GROUP_M = 8
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    _w8a8_gemm[grid](
+        x_int8, w_int8, act_scale, w_scale, y, M, N, K,
+        x_int8.stride(0), x_int8.stride(1),
         w_int8.stride(0), w_int8.stride(1),
         y.stride(0), y.stride(1),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=GROUP_M,

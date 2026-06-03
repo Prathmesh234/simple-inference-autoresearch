@@ -79,3 +79,22 @@ class RMSNorm(nn.Module):
         """Copy a tensor from the checkpoint into this module's parameter."""
         with torch.no_grad():
             self.weight.copy_(weight)
+
+    def add_norm_quant(
+        self, hidden: torch.Tensor, residual: torch.Tensor
+    ):
+        """Fused residual-add + RMSNorm that ALSO emits a per-token int8
+        quantization of the normed output (EXP-D).
+
+        Used for the pre-MLP norm, whose output feeds only the W8A8 gate_up
+        GEMM. Folding the int8 quant into this already-memory-bound kernel
+        removes the standalone per-token quant launch. Returns
+        ``(normed_bf16, new_residual, normed_int8, act_scale)``. The CPU/non-
+        Triton fallback returns ``(normed, new_residual, None, None)`` so the
+        MLP transparently uses its bf16/W8A16 path.
+        """
+        if USE_TRITON and hidden.is_cuda:
+            from kernels.add_rmsnorm_kernel import add_rmsnorm_quant_triton
+            return add_rmsnorm_quant_triton(hidden, residual, self.weight, self.eps)
+        new_residual = residual + hidden
+        return _pytorch_rmsnorm(new_residual, self.weight, self.eps), new_residual, None, None

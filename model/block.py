@@ -156,9 +156,11 @@ class TransformerBlock(nn.Module):
         h = self.attn(h, start_pos=start_pos, kv_cache=kv_cache, decode_ctx=decode_ctx)
 
         # --- 2. MLP block ---
-        # Fold the attention residual add into the pre-MLP norm.
-        h, residual = self.mlp_norm.add_norm(h, residual)
-        h = self.mlp(h)
+        # Fold the attention residual add into the pre-MLP norm, and (EXP-D)
+        # the per-token int8 activation quant for the W8A8 gate_up GEMM, so no
+        # standalone quant kernel runs on the decode hot path.
+        h, residual, h_int8, h_scale = self.mlp_norm.add_norm_quant(h, residual)
+        h = self.mlp(h, x_int8=h_int8, x_scale=h_scale)
 
         # h's residual add stays pending — resolved by the next block's
         # attn_norm.add_norm (or the model's final norm).
