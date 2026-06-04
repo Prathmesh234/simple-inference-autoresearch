@@ -284,3 +284,130 @@ residual + RMSNorm traffic evicts it -> DRAM re-reads -> the 2x gap.
 3. Paged / right-sized KV cache: stop pre-reserving max_seq_len so long-prompt flavors
    batch higher (open NEW higher-agg cells) without OOM.
 4. Reduce the remaining ~10 eager per-step ops (tok copy, pos/kvlen/cos/sin update, sample).
+
+---
+
+## Session jun3-cont (EXP-B): fused-qkv int8 + lm_head int8  — KEEP (frontier win)
+
+### What shipped (commit 83fc4ff)
+- **Fused QKV projection → one W8A16 int8 GEMM** (N=q+2kv=6144) replacing 3 bf16
+  cuBLAS linears. ops/attention.py: wq/wk/wv → w_qkv_int8 buffer + scale (mirrors
+  SwiGLUMLP int8 pattern); o_proj stays bf16 (clean square cuBLAS, int8 loses 0.56x).
+- **lm_head (untied) → W8A16 int8** (ops/embedding.py OutputProjection). 525MB int8
+  weight (>96MB L2 → genuinely HBM-bound), per-channel scale keeps top-50 ordering.
+
+### Measurement (the important methodology lesson)
+- Isolated `--flavors instruct --batch-sizes 1 128` A/B (same config, 2 samples each):
+  - best_agg_tps: baseline [5583,5662] vs EXP-B [5724,5776] → **+2.5%** (no sample overlap)
+  - seq_tps_b1:   baseline [82.3,83.0] vs EXP-B [94.7,95.9] → **+14.6%**
+  - prefill_ms b1: 37.46 → 30.61 (**-18% TTFT**); b128 neutral (373.98→371.46)
+  - peak_vram:    13.30 → 11.97 (**-1.33GB**, matches int8 weight estimate)
+- Full default sweep: agg 5024.6→5055.3 (+0.6% only) — instruct b128 runs LAST so the
+  GPU is thermally throttled; the kernel win is masked. seq_tps_b1 still +14.6% (94.8),
+  vram -1.33GB (38.53). **LESSON: compare same-config; an isolated-run number vs a
+  full-sweep baseline is apples-to-oranges (gave a false +14% before correction).**
+- KEEP rationale: strict Pareto improvement (every guardrail better, agg positive),
+  pushes the frontier outward on the interactivity (b1) + VRAM axes via "fewer bytes
+  per token" (program.md's endorsed strategy). Faithful: per-channel int8, top50=0.98.
+
+### DEAD ENDS confirmed this session (cheap standalone, no wasted profiler runs)
+- **GQA-grouped flash decode** (1 program per (b,kv-head), stream K/V once across the 4
+  sibling q-heads): standalone EXACTLY 1.00x at kv_len 93..512. Short-context KV fits the
+  Ada 96MB L2 so the "4x redundant" reads were already free; long context loses to
+  tl.dot M=4→16 padding. DEAD.
+- **W8A16 b128 tile retune**: at reliable min-clock, gate_up current config optimal; down
+  only ~4.5% (sub-noise). down weight (58MB) fits L2 so BLOCK_M=32's 4x re-read is free.
+  (Earlier 9-12% readings were GPU-clock/throttle noise — always use min-of-N.)
+- **Transposed (K,N) int8 weight layout** for the W8A16 GEMM: WORSE for gate_up
+  (0.70-0.79x). The current (N,K) + tl.dot(.,.trans()) is already efficient. DEAD.
+- **o_proj int8**: 0.56x vs cuBLAS bf16 (clean 4096² square). Stays bf16.
+
+### UNIFYING INSIGHT
+Ada's **96MB L2** makes every "read fewer *redundant* HBM bytes" trick useless at
+short-context b128 (per-layer weights/KV are largely L2-resident). The only genuinely
+HBM-bound ops are the ones whose single weight tensor exceeds 96MB: gate_up (117MB,
+already a 1-stream BLOCK_M=128 optimum) and lm_head (525MB, now int8). Real wins now
+require **fewer weight BYTES** (int4 numerics dead via RTN) or packing more sequences.
+
+### NEXT SESSION — ranked levers
+1. **Higher batch / right-sized KV cache**: with -1.33GB headroom + lower per-step VRAM,
+   try b192/b256 at instruct (if decode_ms grows sub-linearly, agg climbs). Needs the KV
+   cache to not pre-reserve max_seq_len. This is the clearest remaining aggregate lever.
+2. INT4 W4A16 *with calibration* (AWQ/GPTQ) for gate_up only — the one >96MB HBM-bound op.
+   High effort + faithfulness risk; only if #1 is exhausted.
+3. Reduce ~10 eager per-step ops outside the graph (small, profiler-CPU-overhead only).
+
+## EXP-H — retune W8A8 gate_up + lm_head tiles (commit b138eea) — DISCARD
+Min-of-many standalone sweeps found faster configs (numerically identical):
+gate_up _w8a8_swiglu_fwd BLOCK_K 128->256 nw 4->8 (157->149us, 1.05x); lm_head
+_w8a8_gemm (128,128,128,2,4)->(128,256,256,2,8) (684->656us, 1.04x).
+BUT the full-engine A/B did NOT confirm: isolated EXP-H [7446,7091,7472] vs EXP-G
+[7340,7389,7552] overlap heavily (EXP-G mean higher); full sweep 6718.8 < EXP-G
+6804.7. The ~1.5% standalone micro-win is below this window's profiler noise and
+the wider tiles may add register/SMEM pressure in the full captured graph.
+-> DISCARD (git reset --hard ed884c8). LESSON: standalone min-bench wins on
+non-dominant kernels can vanish in the full engine; always confirm with the
+profiler A/B and discard if it doesn't separate.
+
+## EXP-I — INT4 weight on gate_up / lm_head (investigation) — DEAD (no commit)
+Tested 4-bit (grouped RTN, group=32/64/128) on the two genuinely HBM-bound decode
+weights to see if cutting weight bytes below the 96MB L2 helps.
+- **Key realization first**: b128 decode is **compute/MMA-bound, NOT bandwidth-bound**.
+  ~28ms/step moves ~8GB int8 weights = ~280 GB/s effective, far below 960 GB/s HBM.
+  So "fewer weight bytes" (int4) cannot help at b128 except where a weight exceeds L2
+  and forces HBM traffic — only gate_up (117MB int8) and lm_head (525MB) qualify.
+- **int4 gate_up (117->58MB, would fit L2)**: faithfulness DEAD. Through 32 layers of
+  nonlinear SwiGLU the RTN error compounds: final-logit rel_err ~0.22-0.26, argmax only
+  0.83, top5 ~0.70 (g=32..128). Confirms the prior INT4-RTN "coherence dead" for
+  transformer-block weights. Would need AWQ/GPTQ calibration (huge effort, still risky).
+- **int4 lm_head (525->263MB)**: faithfulness OK for greedy (single final projection, no
+  compounding): argmax 1.000, top1 1.000, top5 0.867, top50 0.79-0.86. BUT lm_head is only
+  ~3% of decode (already W8A8) -> halving its bytes is ~1.2% headline = SUB-NOISE (EXP-H
+  lesson: sub-2% washes out in the full engine). Plus top5 0.867 adds sampling-faithfulness
+  risk and needs a new W4A8 (b128) + W4A16 (b1) packed/unpack kernel. Not worth it.
+  (Could revisit ONLY as a b1-latency/VRAM play, which is a secondary frontier metric.)
+-> Both DEAD for the b128 aggregate headline. The decode path's bandwidth tricks are
+   exhausted; remaining levers must be COMPUTE/MMA-side, and W8A8 is already on every
+   GEMM where it's faithful + faster (gate_up, lm_head). qkv/down/o_proj W8A8 stay dead.
+
+## EXP-J — W8A8 int8-tensor-core qkv decode GEMM (free quant via attn_norm) — KEEP
+The decode qkv projection (fused q+k+v, N=6144, K=4096) was the last big GEMM still
+on weight-only W8A16. Prior sessions had marked "qkv W8A8 dead (0.976x GEMM-only,
+0.465x self-quant)" — but that used the DEFAULT (128,128,128) tile. Re-tuning (same
+"wrong shared tile" lesson as EXP-G) found BLOCK_N=64 (BM128,BK128,st3,nw8) runs the
+int8 qkv GEMM at 22us vs 49us for the EXP-G-tuned W8A16 = **2.24x**. The standalone
+_quant_per_token launch is the killer (self-quant e2e 0.655x), so — like EXP-D for
+gate_up — the per-token int8 quant is fused for FREE into the preceding attn_norm
+(add_norm_quant), and the W8A8 qkv GEMM consumes it directly.
+Wiring: model/block.py attn_norm later-blocks -> add_norm_quant (emits int8+scale);
+first block (residual=None) stays W8A16 (1/32 layers). ops/attention.py threads
+x_int8/x_scale through forward -> _decode_graph_forward -> _project_qkv, which
+dispatches W8A8 for 16<M<=256 (b128 decode) and W8A16 for M<=16 (b1) / M>256 (prefill).
+New kernels/w8a8_gemm_kernel.py:w8a8_qkv_prequant (hardcoded tuned tile, graph-safe,
+shape asserts). Reuses the existing per-channel int8 qkv weight buffers (no extra VRAM).
+Faithfulness (clean isolation, same bf16 normed act): decode-shape rel_err 0.0045 /
+cos 0.99996 (10x better than the accepted gate_up W8A8 ~0.06); 32-tok greedy match
+0.828 (> accepted gate_up EXP-C 0.79); coherent output; 256-tok divergences are
+base-model greedy-degeneracy (repetition attractors), not quant garbage.
+Speed: ISO b128 A/B (same thermal window) NEW [7746.6,7706.4] vs BASE-ed884c8
+[7453.0,7405.0] = +4.0% PERFECT SEPARATION (min>max). Full sweep 7008.7 vs same-window
+ed884c8 confirmation 6660.2 = +5.2% (vs recorded 6804.7 = +3.0%). b1 neutral (94.8),
+VRAM unchanged (38.53). KEEP. Cumulative vs baseline cd35f29 (5024.6): +39.5%.
+
+## EXP-K — o_proj W8A8 (investigation) — DEAD (no commit)
+o_proj (N=4096,K=4096) is bf16 cuBLAS today; prior "int8 0.56x dead" used the default
+tile. Re-tuned int8 tile (BLOCK_N=32,BK=256,st3,nw4) GEMM-only = 22.25us vs cuBLAS
+28.83us = 1.30x, and faithful (rel_err 0.0070, attention-output is bounded). BUT the
+win needs FREE activation quant, which o_proj cannot get:
+- Standalone _quant_per_token at M=128,K=4096 = 21us (occupancy-starved: 128 programs
+  on 142 SMs, each a serial 4096-wide reduction) -> W8A8 e2e 45.8us = 0.63x (LOSES).
+- torch-op quant (amax+div+round+cast) = 87us (many launches) = 0.21x. Worse.
+- Free quant is STRUCTURALLY BLOCKED: o_proj's per-token scale spans all Hq*D=4096
+  dims, but flash_decode's per-(B,head) programs each only see D=128 -> cannot compute
+  the per-row amax. A per-head-group-scale W8A8 GEMM + int8-emitting flash_decode could
+  work but is a large, risky redesign for a 6.75% op.
+-> DEAD. GENERAL PRINCIPLE established: a decode GEMM can only go W8A8 if its input
+   comes from a kernel already doing a per-row pass (a NORM) that yields the int8 quant
+   for free. gate_up/qkv/lm_head (norm inputs) are all W8A8 now; down (swiglu-output
+   outliers, faithfulness rel_err~26) and o_proj (attention output, cross-head scale)
+   are blocked. The decode GEMM W8A8 conversion is COMPLETE.

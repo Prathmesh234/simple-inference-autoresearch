@@ -146,3 +146,103 @@ def add_rmsnorm_triton(
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return out.reshape(orig_shape), new_r.reshape(orig_shape)
+
+
+# ── EXP-D: add_rmsnorm fused with per-token int8 activation quant ─────────────
+# The MLP pre-norm (post_attention_layernorm) output feeds ONLY the gate_up
+# projection, which runs W8A8 (int8 activation x int8 weight) at the b128 decode
+# bucket. This kernel folds that per-token int8 quantization INTO the add_rmsnorm
+# pass: the normalized row is already live in registers, so computing its row-max
+# and emitting (int8, scale) is nearly free and removes the standalone
+# _quant_per_token launch (~18-29us/layer) entirely. It still emits the bf16
+# `normed` so the b1 (M<=16) and prefill (M>256) W8A16 fallbacks keep working.
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1,  num_stages=1),
+        triton.Config({}, num_warps=2,  num_stages=1),
+        triton.Config({}, num_warps=4,  num_stages=1),
+        triton.Config({}, num_warps=8,  num_stages=1),
+        triton.Config({}, num_warps=16, num_stages=1),
+        triton.Config({}, num_warps=4,  num_stages=2),
+        triton.Config({}, num_warps=8,  num_stages=2),
+    ],
+    key=["N"],
+)
+@triton.jit
+def _add_rmsnorm_quant_fwd(
+    h_ptr, r_ptr, w_ptr,
+    out_ptr,          # bf16 normed       (n_rows, N)
+    new_r_ptr,        # bf16 new residual (n_rows, N)
+    qi_ptr,           # int8 normed       (n_rows, N)
+    qs_ptr,           # fp32 per-row scale (n_rows,)
+    stride_h, stride_r, stride_o,
+    N, eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    h_row     = h_ptr + pid * stride_h
+    r_row     = r_ptr + pid * stride_r
+    out_row   = out_ptr + pid * stride_o
+    new_r_row = new_r_ptr + pid * stride_o
+
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+
+    h = tl.load(h_row + cols, mask=mask).to(tl.float32)
+    r = tl.load(r_row + cols, mask=mask).to(tl.float32)
+    new_r = (h + r).to(out_ptr.dtype.element_ty)
+    tl.store(new_r_row + cols, new_r, mask=mask)
+
+    xf = new_r.to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=mask).to(tl.float32)
+    var = tl.sum(xf * xf, axis=0) / N
+    rms = tl.rsqrt(var + eps)
+    out = xf * w * rms
+    tl.store(out_row + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
+
+    # Fused per-token symmetric int8 quant of the normed row (same math as
+    # kernels/w8a8_gemm_kernel._quant_per_token, but the data is already here).
+    amax = tl.maximum(tl.max(tl.where(mask, tl.abs(out), 0.0)), 1e-8)
+    scale = amax / 127.0
+    qi = tl.extra.cuda.libdevice.round(out / scale)
+    qi = tl.minimum(tl.maximum(qi, -127.0), 127.0).to(tl.int8)
+    tl.store(qi_ptr + pid * N + cols, qi, mask=mask)
+    tl.store(qs_ptr + pid, scale)
+
+
+def add_rmsnorm_quant_triton(
+    hidden: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+):
+    """add_rmsnorm that ALSO returns a per-token int8 quantization of the normed
+    output for the W8A8 gate_up GEMM.
+
+    Returns:
+        (normed_bf16, new_residual, normed_int8, act_scale)
+        - normed_bf16:  (..., N)        for the W8A16 fallback (b1 / prefill)
+        - new_residual: (..., N)        the threaded residual stream
+        - normed_int8:  (n_rows, N) int8 ready for _w8a8_gemm
+        - act_scale:    (n_rows,)  fp32 per-row scale
+    """
+    assert hidden.shape == residual.shape
+    orig_shape = hidden.shape
+    h_2d = hidden.reshape(-1, hidden.shape[-1])
+    r_2d = residual.reshape(-1, residual.shape[-1])
+    n_rows, N = h_2d.shape
+    BLOCK_SIZE = triton.next_power_of_2(N)
+
+    out = torch.empty_like(h_2d)
+    new_r = torch.empty_like(h_2d)
+    qi = torch.empty((n_rows, N), dtype=torch.int8, device=h_2d.device)
+    qs = torch.empty((n_rows,), dtype=torch.float32, device=h_2d.device)
+
+    grid = (n_rows,)
+    _add_rmsnorm_quant_fwd[grid](
+        h_2d, r_2d, weight, out, new_r, qi, qs,
+        h_2d.stride(0), r_2d.stride(0), out.stride(0),
+        N, eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out.reshape(orig_shape), new_r.reshape(orig_shape), qi, qs

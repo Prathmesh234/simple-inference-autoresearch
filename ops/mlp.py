@@ -134,25 +134,54 @@ class SwiGLUMLP(nn.Module):
             self.w_down_int8.copy_(d_int8)
             self.w_down_scale.copy_(d_scale)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_int8: torch.Tensor | None = None,
+        x_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
-            x : (B, T, hidden_size)
+            x       : (B, T, hidden_size) bf16 normed input.
+            x_int8  : optional (M, hidden_size) int8 — the per-token quantization
+                      of `x` produced by the fused add_rmsnorm (EXP-D). When
+                      present and the batch is in the W8A8 decode bucket, the
+                      gate_up GEMM consumes it directly, skipping a standalone
+                      activation-quant launch.
+            x_scale : optional (M,) fp32 per-row scale paired with `x_int8`.
 
         Returns:
             (B, T, hidden_size)
         """
         if USE_TRITON and x.is_cuda:
             from kernels.w8a16_gemm_kernel import w8a16_linear_triton
-            # --- 1. Fused gate + up projection (int8 weights) ---
-            combined = w8a16_linear_triton(
-                x, self.w_gate_up_int8, self.w_gate_up_scale
-            )                                              # (B, T, 2*intermediate)
-            gate, up = combined.chunk(2, dim=-1)
-
-            # --- 2. Fused silu(gate) * up ---
-            from kernels.swiglu_kernel import swiglu_triton
-            fused = swiglu_triton(gate, up)
+            from kernels.w8a8_gemm_kernel import (
+                w8a8_linear_triton, w8a8_swiglu_prequant,
+            )
+            # --- 1+2. Fused gate+up (W8A8 int8 tensor cores) + SwiGLU ---
+            # gate_up is the single dominant decode GEMM (N=28672). Its input is
+            # the post-rmsnorm residual stream, whose activation outliers are
+            # absorbed by per-token dynamic int8 scaling (end-to-end rel_err
+            # matches the accepted weight-only int8). The W8A8 path covers the
+            # b128 decode bucket; b1 (M<=16) and prefill (M>256) fall back to
+            # W8A16. When the preceding add_rmsnorm already produced the int8
+            # activation (EXP-D), a single fused kernel does the gate_up GEMM
+            # AND the silu(gate)*up epilogue (EXP-E), skipping both the standalone
+            # activation-quant launch and the separate swiglu launch and never
+            # materialising the (M, 2*intermediate) tensor.
+            M = x.reshape(-1, x.shape[-1]).shape[0]
+            if x_int8 is not None and 16 < M <= 256:
+                fused = w8a8_swiglu_prequant(
+                    x_int8, x_scale, self.w_gate_up_int8, self.w_gate_up_scale,
+                    x.shape,
+                )
+            else:
+                combined = w8a8_linear_triton(
+                    x, self.w_gate_up_int8, self.w_gate_up_scale
+                )                                          # (B, T, 2*intermediate)
+                gate, up = combined.chunk(2, dim=-1)
+                from kernels.swiglu_kernel import swiglu_triton
+                fused = swiglu_triton(gate, up)
 
             # --- 3. Down projection (int8 weights) ---
             return w8a16_linear_triton(fused, self.w_down_int8, self.w_down_scale)

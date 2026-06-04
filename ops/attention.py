@@ -87,20 +87,79 @@ class GroupedQueryAttention(nn.Module):
         # shared KVCache pool. Set at construction time by LlamaModel.
         self.layer_idx    = layer_idx
 
-        # Projection weights — no bias in Llama
-        self.wq = nn.Parameter(torch.empty(num_heads_q  * head_dim, hidden_size))
-        self.wk = nn.Parameter(torch.empty(num_heads_kv * head_dim, hidden_size))
-        self.wv = nn.Parameter(torch.empty(num_heads_kv * head_dim, hidden_size))
+        # Q/K/V sizes (out_features of each projection).
+        self.q_size  = num_heads_q  * head_dim   # 4096
+        self.kv_size = num_heads_kv * head_dim   # 1024
+
+        # Weight-only int8 (W8A16) FUSED qkv projection. The three q/k/v linears
+        # share the same input x and are streamed together as ONE int8 GEMM of
+        # out_features = q_size + 2*kv_size (= 6144 for Llama-3.1-8B). Fusing them
+        # both halves the qkv weight bytes (1 byte vs 2) AND amortizes the single
+        # GEMM's fixed overhead across all three projections — standalone this is
+        # ~1.25x vs three separate cuBLAS bf16 linears at the b128 decode shape,
+        # whereas EACH projection in isolation loses to cuBLAS (the small-N kernel
+        # floor) and a plain bf16 fusion gave no headline gain post-CUDA-graph.
+        # o_proj stays bf16: it's a clean square (4096x4096) cuBLAS GEMM that the
+        # Triton int8 kernel cannot beat at M=128.
+        #
+        # These are buffers, not Parameters, so `module.to(dtype)` skips the int8
+        # storage (integer tensors are not cast) while the fp32 scale is cast to
+        # the model dtype — exactly the SwiGLUMLP int8 pattern. Rows are laid out
+        # [0:q_size)=q, [q_size:q_size+kv_size)=k, [..:..+kv_size)=v.
+        qkv_out = self.q_size + 2 * self.kv_size
+        self.register_buffer(
+            "w_qkv_int8", torch.empty(qkv_out, hidden_size, dtype=torch.int8)
+        )
+        self.register_buffer(
+            "w_qkv_scale", torch.empty(qkv_out, dtype=torch.float32)
+        )
         self.wo = nn.Parameter(torch.empty(hidden_size, num_heads_q * head_dim))
 
     def load_weights(self, wq, wk, wv, wo):
+        from kernels.w8a16_gemm_kernel import quantize_int8_per_channel
         with torch.no_grad():
-            self.wq.copy_(wq)
-            self.wk.copy_(wk)
-            self.wv.copy_(wv)
+            qkv = torch.cat([wq, wk, wv], dim=0)
+            qkv_int8, qkv_scale = quantize_int8_per_channel(qkv)
+            self.w_qkv_int8.copy_(qkv_int8)
+            self.w_qkv_scale.copy_(qkv_scale)
             self.wo.copy_(wo)
 
-    def _decode_graph_forward(self, x, kv_cache, ctx):
+    def _project_qkv(self, x, B, T, x_int8=None, x_scale=None):
+        """Fused int8 qkv projection → (q, k, v) reshaped into heads.
+
+        Returns q (B,T,Hq,D), k (B,T,Hkv,D), v (B,T,Hkv,D). The last-dim slices of
+        the contiguous (B,T,6144) output are split into heads with reshape (a view,
+        no copy, since only the contiguous final dim is split).
+
+        When ``x_int8``/``x_scale`` are provided (the per-token int8 quant of the
+        normed activation, emitted for free by the preceding fused
+        ``attn_norm.add_norm_quant``) and M = B*T is in the W8A8 decode bucket
+        (16 < M <= 256), the projection runs as a true int8 tensor-core GEMM
+        (~2.2x over W8A16 at the b128 decode shape). Outside that bucket — b1
+        decode (M<=16, latency-bound) and prefill (M>256) — it falls back to the
+        weight-only W8A16 path on the bf16 activation.
+        """
+        if USE_TRITON and x.is_cuda:
+            M = B * T
+            if x_int8 is not None and 16 < M <= 256:
+                from kernels.w8a8_gemm_kernel import w8a8_qkv_prequant
+                qkv = w8a8_qkv_prequant(
+                    x_int8, x_scale, self.w_qkv_int8, self.w_qkv_scale, x.shape
+                )
+            else:
+                from kernels.w8a16_gemm_kernel import w8a16_linear_triton
+                qkv = w8a16_linear_triton(x, self.w_qkv_int8, self.w_qkv_scale)
+        else:
+            w_qkv = self.w_qkv_int8.to(x.dtype) * self.w_qkv_scale.to(x.dtype)[:, None]
+            qkv = F.linear(x, w_qkv)
+        q = qkv[..., :self.q_size].reshape(B, T, self.num_heads_q, self.head_dim)
+        k = qkv[..., self.q_size:self.q_size + self.kv_size].reshape(
+            B, T, self.num_heads_kv, self.head_dim)
+        v = qkv[..., self.q_size + self.kv_size:].reshape(
+            B, T, self.num_heads_kv, self.head_dim)
+        return q, k, v
+
+    def _decode_graph_forward(self, x, kv_cache, ctx, x_int8=None, x_scale=None):
         """CUDA-graph-capturable single-token (T==1) decode attention.
 
         All ops have a fixed launch signature; the per-step position lives in
@@ -120,9 +179,7 @@ class GroupedQueryAttention(nn.Module):
             (no SDPA mask fallback) while staying graph-safe.
         """
         B, T, _ = x.shape  # T == 1
-        q = F.linear(x, self.wq).view(B, T, self.num_heads_q,  self.head_dim)
-        k = F.linear(x, self.wk).view(B, T, self.num_heads_kv, self.head_dim)
-        v = F.linear(x, self.wv).view(B, T, self.num_heads_kv, self.head_dim)
+        q, k, v = self._project_qkv(x, B, T, x_int8=x_int8, x_scale=x_scale)
 
         q, k = apply_rope(q, k, ctx.cos, ctx.sin)
 
@@ -146,6 +203,8 @@ class GroupedQueryAttention(nn.Module):
         start_pos: int = 0,
         kv_cache=None,
         decode_ctx=None,
+        x_int8: torch.Tensor | None = None,
+        x_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -171,19 +230,13 @@ class GroupedQueryAttention(nn.Module):
             (B, T, hidden_size)
         """
         if decode_ctx is not None:
-            return self._decode_graph_forward(x, kv_cache, decode_ctx)
+            return self._decode_graph_forward(x, kv_cache, decode_ctx,
+                                              x_int8=x_int8, x_scale=x_scale)
 
         B, T, _ = x.shape
 
-        # --- 1. Project to Q, K, V ---
-        q = F.linear(x, self.wq)  # (B, T, n_heads_q  * head_dim)
-        k = F.linear(x, self.wk)  # (B, T, n_heads_kv * head_dim)
-        v = F.linear(x, self.wv)  # (B, T, n_heads_kv * head_dim)
-
-        # --- 2. Reshape into heads ---
-        q = q.view(B, T, self.num_heads_q,  self.head_dim)
-        k = k.view(B, T, self.num_heads_kv, self.head_dim)
-        v = v.view(B, T, self.num_heads_kv, self.head_dim)
+        # --- 1. Project to Q, K, V (fused int8 GEMM) + reshape into heads ---
+        q, k, v = self._project_qkv(x, B, T, x_int8=x_int8, x_scale=x_scale)
 
         # --- 3. Apply RoPE to Q and K ---
         # Fetch cos/sin already in the activation dtype from RopeFrequencies'
