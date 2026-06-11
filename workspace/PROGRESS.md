@@ -478,3 +478,45 @@ NEXT: down is no longer the elephant; gate_up _w8a8_swiglu_fwd (24%) and the rem
 _w8a8_gemm are now the largest. Consider fusing the down quant into the swiglu epilogue
 (atomic per-row amax) to reclaim the ~15us standalone quant, and/or SmoothQuant a=0.7
 folding for extra faithfulness margin.
+
+## EXP-N — o_proj W8A8 (b128 decode bucket) — KEEP (+7.6%)
+OVERTURNS the EXP-K "o_proj W8A8 is DEAD" verdict, exactly like EXP-M did for down.
+EXP-K killed o_proj on two grounds — both wrong:
+
+(1) "GEMM only 1.30x" — a WRONG-TILE artifact (the same lesson as EXP-G/qkv and
+    EXP-M/down). A tile sweep at the real decode shape (M=128, K=N=4096) found
+    BM=32,BN=64,BK=256,nw=4,ns=2,GROUP_M=8: int8 GEMM 24.0us vs bf16 cuBLAS 50.7us =
+    2.11x. o_proj's 16.7 MB int8 weight is L2-resident on Ada (96 MB L2), so the GEMM
+    is compute/L2-bound and the int8 tensor cores (~2x bf16) pay off — even more so
+    than down (smaller weight, more L2-resident).
+
+(2) "free quant required / quant occupancy-starved" — the per-token _quant_per_token
+    of the attention output (no preceding per-row norm) is ~14us standalone. KEY
+    FINDING: that ~14us is CONSTANT across K=4096 and K=14336 (3.5x the data) and
+    across num_warps -> it is LAUNCH/occupancy-bound, NOT execution-bound. Inside the
+    captured CUDA decode graph (replay skips launch overhead) that cost largely
+    vanishes, which is why the in-graph win (+7.6%) DWARFS the standalone net the
+    wall-clock bench shows (the standalone bench compares a 2-launch Triton path
+    against single-launch cuBLAS, so it under-reports — use CUDA-event device time).
+
+(3) "cross-head scale" faithfulness — the per-token scale spans all Hq*D=4096 (all
+    heads share one scale). FALSIFIED qualitatively: greedy generation with the REAL
+    engine (B=128, both down + o_proj W8A8) is fully coherent and factually correct
+    (Paris; Rayleigh scattering; cookie recipe; Newton's laws). rel_err 1.2e-2 vs bf16.
+
+MECHANISM / TUNING:
+- New kernel kernels/w8a8_gemm_kernel.py::w8a8_oproj_linear (self-quant + tuned tile
+  32/64/256/nw4/ns2). Dispatch in ops/attention.MultiHeadAttention._decode_graph_forward
+  for 64<M<=256; b1 and prefill keep bf16 cuBLAS (self.wo Parameter retained). Weight
+  quantized to int8 buffers (w_o_int8 / w_o_scale) at load_weights.
+- Standalone gate: benchmarks/benchmark_kernel/bench_w8a8_oproj_compare.py (faithfulness
+  rel_err 1.2e-2; standalone wall-clock under-reports speed — see note above).
+
+RESULT (full sweep): best_agg_tps 7445.0 -> 8009.5 = +7.6% headline; confirmation run
+8044.7 (stable, ~0.4% apart). seq_tps_b1 94.4 (neutral, b1 = bf16). peak_vram
+38.53 -> 39.07 (+0.54 GB int8 o_proj buffer, in budget). KEEP.
+NEXT: with qkv, gate_up, down, lm_head AND o_proj all int8, every major decode GEMM is
+now W8A8. flash_decode (already tuned) and the per-token quant launches are the only
+remaining non-int8 decode work. The launch-bound quant insight (~14us, hidden in-graph)
+explains why both down and o_proj won bigger in-graph than standalone — future quant
+fusion (e.g. into the flash_decode epilogue) is low-value since the cost is graph-hidden.
