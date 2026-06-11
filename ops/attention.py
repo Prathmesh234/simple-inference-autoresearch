@@ -114,6 +114,15 @@ class GroupedQueryAttention(nn.Module):
             "w_qkv_scale", torch.empty(qkv_out, dtype=torch.float32)
         )
         self.wo = nn.Parameter(torch.empty(hidden_size, num_heads_q * head_dim))
+        # int8 mirror of wo for the W8A8 decode o_proj (the bf16 wo stays for
+        # prefill / b1). Buffers (not Parameters) so module.to(dtype) skips the
+        # int8 storage while casting the fp32 scale — same pattern as w_qkv_int8.
+        self.register_buffer(
+            "w_o_int8", torch.empty(hidden_size, num_heads_q * head_dim, dtype=torch.int8)
+        )
+        self.register_buffer(
+            "w_o_scale", torch.empty(hidden_size, dtype=torch.float32)
+        )
 
     def load_weights(self, wq, wk, wv, wo):
         from kernels.w8a16_gemm_kernel import quantize_int8_per_channel
@@ -123,6 +132,9 @@ class GroupedQueryAttention(nn.Module):
             self.w_qkv_int8.copy_(qkv_int8)
             self.w_qkv_scale.copy_(qkv_scale)
             self.wo.copy_(wo)
+            wo_int8, wo_scale = quantize_int8_per_channel(wo)
+            self.w_o_int8.copy_(wo_int8)
+            self.w_o_scale.copy_(wo_scale)
 
     def _project_qkv(self, x, B, T, x_int8=None, x_scale=None):
         """Fused int8 qkv projection → (q, k, v) reshaped into heads.
@@ -195,6 +207,10 @@ class GroupedQueryAttention(nn.Module):
         from kernels.flash_decode_kernel import attention_flash_decode
         out = attention_flash_decode(q, kc, vc, ctx.kv_len)  # (B, 1, Hq, D)
         out = out.reshape(B, T, self.num_heads_q * self.head_dim)
+        M = B * T
+        if 64 < M <= 256:
+            from kernels.w8a8_gemm_kernel import w8a8_oproj_linear
+            return w8a8_oproj_linear(out, self.w_o_int8, self.w_o_scale)
         return F.linear(out, self.wo)
 
     def forward(
