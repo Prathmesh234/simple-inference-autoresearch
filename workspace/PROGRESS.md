@@ -434,3 +434,47 @@ is config-insensitive (~22.7us flat) so single-stream is unaffected.
 Result (full sweep): _flash_decode_fwd 138us -> 58.7us = 2.35x (15.06% -> 6.55%).
 best_agg_tps 5852.1 -> 6123.5 = +4.6% headline. seq_tps_b1 94.9 -> 94.5 (neutral).
 peak_vram 38.53 unchanged. KEEP. New dominant op: down _w8a16_gemm 48.17%.
+
+## EXP-M — down_proj W8A8 (b128 decode bucket) — KEEP (+21.6%, the big one)
+This OVERTURNS the EXP-K "down W8A8 is DEAD / decode GEMM W8A8 is COMPLETE" verdict.
+Two prior blockers, both re-examined:
+
+(1) FAITHFULNESS — prior "RTN rel_err~26" was PER-TENSOR quant. With PER-TOKEN
+    (per-row) int8 act quant (what the _quant_per_token kernel actually does), the
+    down GEMM rel_err on REAL post-SwiGLU activations (8 generic calib prompts, 32
+    layers, workspace/scripts/probe_down_smoothquant.py) is only ~0.070 naive /
+    ~0.038 SmoothQuant a=0.7 — at/below the accepted gate_up W8A8 band (~0.06).
+    End-to-end teacher-forced next-token agreement vs bf16 (probe_down_w8a8_e2e.py):
+    W8A16 100% | naive W8A8 93.8% | SQ a=0.7 97.2% (gate_up bf16). Greedy generation
+    with the REAL engine (naive W8A8 down, B=128) is fully coherent and factually
+    correct (Paris; Rayleigh scattering; Newton's laws) — program.md coherence gate
+    PASSED with naive, so SmoothQuant was NOT needed to ship.
+
+(2) "FREE QUANT REQUIRED" PRINCIPLE — falsified for down. The EXP-K principle said a
+    decode GEMM can only go W8A8 if a preceding norm yields the int8 quant for free.
+    down's input is the SwiGLU output (no per-row pass), so it pays a standalone
+    _quant_per_token (~15us at K=14336). That principle held for o_proj because its
+    GEMM win was small (1.30x). down is different: its 58.7 MB int8 weight FITS Ada's
+    96 MB L2, so the GEMM is compute/L2-bound (not HBM-bound) and int8 tensor cores
+    give a ~1.9x GEMM win that DWARFS the quant cost. Lesson: the standalone-quant tax
+    is worth paying when the L2-resident weight makes the int8-MMA win big.
+
+MECHANISM / TUNING:
+- The generic W8A8 tile (128,128,128 — what made earlier "down W8A8 dead" benches show
+  0.65-0.77x) is wrong for down's huge K=14336. A tile sweep at M=128,K=14336,N=4096
+  found BM=64,BN=64,BK=256,nw=4,ns=4,GROUP_M=8: int8 GEMM 50.2us vs W8A16 95.5us =
+  1.90x (below the 61us HBM floor -> confirms L2-resident, not HBM-bound). Same
+  "wrong tile hid the win" lesson as EXP-G/qkv.
+- Net standalone incl. the per-token quant (15.5us): M=128 -> 1.19x, M=256 -> 1.45x;
+  M=32/64 LOSE (quant under-occupied), so dispatch is 64<M<=256 only. b1/prefill keep
+  W8A16. New kernel: kernels/w8a8_gemm_kernel.py::w8a8_down_linear. Standalone gate:
+  benchmarks/benchmark_kernel/bench_w8a8_down_compare.py.
+
+RESULT (full sweep): instruct b128 decode 20.9ms -> 17.19ms. best_agg_tps
+6123.5 -> 7445.0 = +21.6% headline. seq_tps_b1 94.5 -> 94.4 (neutral, b1 = W8A16).
+peak_vram 38.53 unchanged. In-graph op table: _w8a8_gemm calls 2016 -> 4032 (qkv+down),
+_w8a16_gemm calls collapse to lm_head/b1/prefill. KEEP.
+NEXT: down is no longer the elephant; gate_up _w8a8_swiglu_fwd (24%) and the remaining
+_w8a8_gemm are now the largest. Consider fusing the down quant into the swiglu epilogue
+(atomic per-row amax) to reclaim the ~15us standalone quant, and/or SmoothQuant a=0.7
+folding for extra faithfulness margin.
