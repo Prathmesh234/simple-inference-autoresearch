@@ -411,3 +411,26 @@ win needs FREE activation quant, which o_proj cannot get:
    for free. gate_up/qkv/lm_head (norm inputs) are all W8A8 now; down (swiglu-output
    outliers, faithfulness rel_err~26) and o_proj (attention output, cross-head scale)
    are blocked. The decode GEMM W8A8 conversion is COMPLETE.
+
+## EXP-L — flash_decode: hardcode config (BLOCK_N=16, num_warps=1), remove autotune — KEEP
+The decode attention kernel (kernels/flash_decode_kernel.py) used
+`@triton.autotune(key=["D"])`. D=128 is constant, so the autotuner runs do_bench
+ONCE on the first call's shape and caches that config for every later shape. In a
+full sweep the first decode call is chat b1 (32 programs), so the cached config is
+tuned for B*Hq=32 and then reused for the instruct b128 headline (B*Hq=4096) — a
+slow fit: baseline full-sweep flash_decode = 138us/call (15.06% of decode). It also
+varied run-to-run (iso 57-95us) because do_bench is noisy, polluting every A/B, and
+a do_bench inside the decode path is unsafe under CUDA-graph capture (alloc+sync).
+A direct config sweep of the headline shape (workspace/scripts/bench_flash_decode_cfg.py,
+calling `_flash_decode_fwd.fn` to bypass the autotuner) found num_warps=1 is fastest
+at every length tested (kv93 24.3us, kv512 314us, kv2048 1601us) — each program is a
+tiny single-query attention, so minimal warps = maximal occupancy. The old autotune
+list only offered num_warps>=2, so it could NEVER reach the best config. BLOCK_N=16
+is best at the short headline kv_len AND at long contexts (kv2048), ~5% off only at
+the mid kv~512 range. Hardcoded BLOCK_N=16, num_warps=1, num_stages=2; removed the
+autotune entirely (aligns with the CHECKPOINT rule "no autotune in the decode path").
+Numerics vs SDPA reference: rel_err ~3e-3 (bf16-level) across kv 40..2000. b1 decode
+is config-insensitive (~22.7us flat) so single-stream is unaffected.
+Result (full sweep): _flash_decode_fwd 138us -> 58.7us = 2.35x (15.06% -> 6.55%).
+best_agg_tps 5852.1 -> 6123.5 = +4.6% headline. seq_tps_b1 94.9 -> 94.5 (neutral).
+peak_vram 38.53 unchanged. KEEP. New dominant op: down _w8a16_gemm 48.17%.
