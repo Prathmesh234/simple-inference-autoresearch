@@ -100,23 +100,31 @@ int4 gate_up (faith) · int4 lm_head (sub-noise) · qkv/down cuBLAS bf16 (not be
 GQA-grouped flash decode · higher batch (profiler caps sweep at b128 → irrelevant to
 headline) · INT4 RTN · KV-int8 · transposed layout · split-K · attention wq/wk/wv W8A16
 (skinny-N floor) · down tile BLOCK_M=128 (EXP-1, slower in-graph) · down W8A8 tile
-re-sweep (64/64/256 optimal) · gate_up swiglu retune (sub-noise, BLOCK_N pinned at 64).
+re-sweep (64/64/256 optimal) · gate_up swiglu retune (sub-noise, BLOCK_N pinned at 64) ·
+**W4A8 grouped-int4 gate_up (EXP-O)** — faithfulness PASSES (g=64 coherent) but the
+hand-rolled Triton kernel is overhead-bound (0.90× best): gate_up W8A8 is only ~1.3×
+above the HBM floor at M=128, so it is NOT HBM-bound enough to pay for int4
+unpack + per-group fp32 rescale.
 NOTE: BOTH "down W8A8 DEAD" (jun3, per-tensor artifact) AND "o_proj W8A8 DEAD" (EXP-K,
 "1.3× GEMM") were WRONG — now the +21.6% (EXP-M) and +7.6% (EXP-N) wins. The o_proj
 "dead" verdict used a generic tile (real is 2.11×) AND under-counted the graph-hidden
 quant. LESSON: re-test any "dead" verdict that hinges on a WRONG TILE, PER-TENSOR
 quant, or a STANDALONE quant cost (launch overhead vanishes in the CUDA graph).
 
-## Next-session candidate levers (every major decode GEMM is now int8)
+## Next-session candidate levers (every major decode GEMM is now int8; W4 gate_up dead)
 - **Re-trace the op table FIRST** with fresh eyes before picking a lever.
-- **gate_up swiglu** (the biggest decode op): already W8A8-fused, BLOCK_N=64 pinned
-  (spill at 128); retune ~1.5% (sub-noise, confirmed dead). Hard to beat.
-- **Reduce decode kernel launch count / fusion** — the GEMMs are int8; the next class
-  of win is fewer launches (e.g. fuse rope into qkv epilogue, fuse the two
-  _quant_per_token). But quant is launch-bound and ALREADY graph-hidden, so low value.
+- **gate_up swiglu** (the biggest decode op): W8A8-fused, BLOCK_N=64 pinned; retune
+  ~1.5% (sub-noise). W4A8 (EXP-O) is faithful but kernel-overhead-bound (0.90×). The op
+  is only ~1.3× above the HBM floor → not enough headroom for any weight-bit trick to
+  pay for the unpack overhead. Treat gate_up as DONE.
+- **Reduce decode kernel launch count / fusion** — GEMMs are int8; next class of win is
+  fewer launches. But the quant launches are already graph-hidden, so low value.
 - **SmoothQuant α=0.7 folding** for down/o_proj — NO speed gain, only faithfulness
   margin; needs load-time calibration plumbing. Naive already coherent. Low priority.
 - **W8A8 prefill** for TTFT (secondary metric; primary is decode b128).
+- KEY LESSON THIS SESSION: an op being "the biggest" + "weight > L2" does NOT mean it is
+  HBM-bound. Measure µs-above-HBM-floor first (down/o_proj were ~2× above → L2/compute
+  bound → int8 MMA won; gate_up is only ~1.3× above → already near floor → no lever).
 
 ## Run env (MUST re-set every session — fresh box)
 ```

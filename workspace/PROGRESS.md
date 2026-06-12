@@ -520,3 +520,32 @@ now W8A8. flash_decode (already tuned) and the per-token quant launches are the 
 remaining non-int8 decode work. The launch-bound quant insight (~14us, hidden in-graph)
 explains why both down and o_proj won bigger in-graph than standalone — future quant
 fusion (e.g. into the flash_decode epilogue) is low-value since the cost is graph-hidden.
+
+## EXP-O — W4A8 grouped-int4 gate_up (the HBM-bound elephant) — DISCARD (standalone 0.90x)
+HYPOTHESIS: gate_up is the biggest decode op (~25%) and its 117 MB int8 weight exceeds
+Ada's 96 MB L2, so the fused W8A8 swiglu should be HBM-bound; packing the weight to
+4-bit (59 MB, also L2-resident) would halve the weight read and approach ~2x.
+
+FAITHFULNESS — PASSES (overturns the old "int4 gate_up dead (faith)" verdict, which
+used per-tensor/per-channel int4). Per-GROUP int4 (group=64 along K):
+- faith_gateup_int4.py: final-token argmax agreement g=64/g=32 = 1.000 (g=128 = 0.833),
+  though logit_rel ~0.24-0.28 and top5 overlap ~0.6-0.7 (looser than down/o_proj).
+- coherence_gateup_int4.py: REAL-engine greedy generation at g=64 is fully coherent and
+  factually correct (Paris/Washington/London/Ottawa/Moscow/Rome capitals; Rayleigh
+  scattering; Newton's laws). So faithfulness is NOT the blocker.
+
+KERNEL PERF — FAILS (the real blocker). Built kernels/w4a8_swiglu_kernel.py: split-half
+int4 packing (byte holds K-elem j low-nibble + j+32 high-nibble within each 64-group),
+grouped fused GEMM+SwiGLU with int8 activation, int32 dot per group scaled by the
+per-group weight scale into an fp32 accumulator. Numerically correct (rel 1.4e-2 vs the
+grouped-int4 dequant reference) BUT slower: best tuned config (BM128/BN64/nw4/ns2) =
+175us vs 158us W8A8 = 0.90x; default 197us = 0.80x.
+WHY: gate_up W8A8 (158us) is only ~1.3x above the 122us HBM floor (117MB/960GB/s) — it
+is NOT strongly HBM-bound at M=128, so halving the weight read saves little, and the
+int4 unpack (mask/shift/sign-extend) + per-group fp32 rescale (64 groups x (128x64)
+FMA x2) + small per-group dots OUTWEIGH the HBM savings. A production low-bit kernel
+(Marlin/AWQ-style layout + pipelining) might win, but that is far beyond scope and the
+hand-rolled Triton path clearly loses here.
+VERDICT: DISCARD. Removed the un-wired kernel + bench. Kept the faith/coherence scripts
+as evidence. NEW CONFIRMED-DEAD entry: W4A8 grouped gate_up (kernel overhead-bound; the
+op is only ~1.3x above HBM floor, not HBM-bound enough to pay for int4 unpack+regroup).
