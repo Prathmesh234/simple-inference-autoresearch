@@ -327,3 +327,130 @@ def w8a8_qkv_prequant(
         num_stages=num_stages, num_warps=num_warps,
     )
     return y.reshape(*orig_shape[:-1], N)
+
+
+def w8a8_down_linear(
+    x: torch.Tensor,
+    w_int8: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Self-quantizing W8A8 GEMM tuned for the MLP **down** projection.
+
+    down is the dominant decode GEMM (M=128, K=14336 intermediate, N=4096 hidden).
+    Its 58.7 MB int8 weight fits Ada's 96 MB L2, so the GEMM is compute/L2-bound
+    rather than HBM-bound, and the int8 tensor cores (~2x bf16) pay off: with the
+    down-specific tile below the int8 GEMM runs ~50us vs ~95us for the W8A16
+    (weight-int8, bf16-MMA) path — a 1.9x GEMM speedup.
+
+    Unlike gate_up/qkv, down's input is the SwiGLU output, which is NOT produced by
+    a per-row pass, so there is no free activation int8 quant: we pay a standalone
+    per-token _quant_per_token launch (~15us at K=14336). Net standalone is still
+    ~1.2-1.45x over W8A16. Tile is hardcoded (no autotune) and shapes are static at
+    a fixed batch, so the whole path replays inside the captured CUDA decode graph.
+
+    Caller (ops/mlp.SwiGLUMLP.forward) owns the M-bucket dispatch: only invoked for
+    16 < M <= 256; b1 (M<=16, bandwidth-bound) and prefill (M>256) keep W8A16.
+
+    Args:
+        x:      (..., K) bf16 SwiGLU output (down input).
+        w_int8: (N, K) int8 down weight (out_features=hidden, in_features=I).
+        w_scale: (N,) per-output-channel fp32 scale.
+    Returns:
+        (..., N) bf16.
+    """
+    orig_shape = x.shape
+    K = orig_shape[-1]
+    x2d = x.reshape(-1, K)
+    if x2d.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        x2d = x2d.to(torch.bfloat16)
+    x2d = x2d.contiguous()
+    M = x2d.shape[0]
+    N = w_int8.shape[0]
+
+    xi = torch.empty((M, K), dtype=torch.int8, device=x.device)
+    xs = torch.empty((M,), dtype=torch.float32, device=x.device)
+    _quant_per_token[(M,)](
+        x2d, xi, xs, M, K, x2d.stride(0), x2d.stride(1),
+        BLOCK_K=triton.next_power_of_2(K), num_warps=4,
+    )
+
+    y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 256
+    num_stages, num_warps = 4, 4
+    GROUP_M = 8
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    _w8a8_gemm[grid](
+        xi, w_int8, xs, w_scale, y, M, N, K,
+        xi.stride(0), xi.stride(1),
+        w_int8.stride(0), w_int8.stride(1),
+        y.stride(0), y.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=GROUP_M,
+        num_stages=num_stages, num_warps=num_warps,
+    )
+    return y.reshape(*orig_shape[:-1], N)
+
+
+def w8a8_oproj_linear(
+    x: torch.Tensor,
+    w_int8: torch.Tensor,
+    w_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Self-quantizing W8A8 GEMM for the attention **output** (o_proj) projection.
+
+    o_proj is a clean square GEMM (M=128 decode, K=4096 = Hq*D, N=4096 hidden) whose
+    16.7 MB int8 weight is L2-resident on Ada (96 MB L2), so it is compute/L2-bound,
+    not HBM-bound: with the tile below the int8 tensor-core GEMM runs ~24us vs ~50us
+    for bf16 cuBLAS — a ~2.1x GEMM speedup. (The earlier "o_proj W8A8 is dead, only
+    1.3x" verdict used a generic tile — the same wrong-tile artifact corrected for
+    qkv/down.)
+
+    o_proj's input is the FlashAttention output, which is not produced by a per-row
+    normalization pass, so there is no free activation int8 quant: we pay a standalone
+    per-token _quant_per_token launch. That launch is launch/occupancy-bound (~14us
+    standalone regardless of K) but its cost is largely hidden inside the captured
+    CUDA decode graph (replay skips launch overhead), exactly as for w8a8_down_linear.
+
+    The per-token scale spans all heads (Hq*D), so small-magnitude heads share one
+    scale with large ones; greedy output stays coherent at the b128 decode shape
+    (verified) — the same naive per-token quant shipped for down_proj.
+
+    Caller (ops/attention.MultiHeadAttention._decode_graph_forward) owns the M-bucket
+    dispatch: only invoked for 64 < M <= 256; b1 and prefill keep bf16 cuBLAS.
+
+    Args:
+        x:       (..., K) bf16 attention output (o_proj input), K = Hq*D = 4096.
+        w_int8:  (N, K) int8 o_proj weight (out_features=hidden, in_features=Hq*D).
+        w_scale: (N,) per-output-channel fp32 scale.
+    Returns:
+        (..., N) bf16.
+    """
+    orig_shape = x.shape
+    K = orig_shape[-1]
+    x2d = x.reshape(-1, K)
+    if x2d.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        x2d = x2d.to(torch.bfloat16)
+    x2d = x2d.contiguous()
+    M = x2d.shape[0]
+    N = w_int8.shape[0]
+
+    xi = torch.empty((M, K), dtype=torch.int8, device=x.device)
+    xs = torch.empty((M,), dtype=torch.float32, device=x.device)
+    _quant_per_token[(M,)](
+        x2d, xi, xs, M, K, x2d.stride(0), x2d.stride(1),
+        BLOCK_K=triton.next_power_of_2(K), num_warps=4,
+    )
+
+    y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 256
+    num_stages, num_warps = 2, 4
+    GROUP_M = 8
+    grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),)
+    _w8a8_gemm[grid](
+        xi, w_int8, xs, w_scale, y, M, N, K,
+        xi.stride(0), xi.stride(1),
+        w_int8.stride(0), w_int8.stride(1),
+        y.stride(0), y.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, GROUP_M=GROUP_M,
+        num_stages=num_stages, num_warps=num_warps,
+    )
+    return y.reshape(*orig_shape[:-1], N)

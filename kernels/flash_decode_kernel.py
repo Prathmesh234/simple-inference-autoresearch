@@ -35,16 +35,21 @@ import triton
 import triton.language as tl
 
 
-def _decode_configs():
-    configs = []
-    for BN in (32, 64, 128):
-        for w in (2, 4, 8):
-            for s in (2, 3):
-                configs.append(triton.Config({"BLOCK_N": BN}, num_warps=w, num_stages=s))
-    return configs
+# Hardcoded launch config for the decode attention kernel. No @triton.autotune:
+# its do_bench allocates + syncs, which is illegal under CUDA-graph capture, and
+# its key=["D"] caches whichever config the FIRST call's shape (e.g. chat b1 in a
+# full sweep) selected, then reuses it for every shape — including the b128
+# headline, where it lands on a slow config (~138us/call). A direct sweep of the
+# headline shape (B*Hq=4096 single-query programs, kv_len~93) showed num_warps=1
+# is fastest (each program is a tiny single-query attention; minimal warps =>
+# maximal occupancy), but the old autotune list only offered num_warps>=2 so it
+# could never reach it. BLOCK_N=16 is fastest at the short headline kv_len and at
+# long contexts (kv_len 2048), losing only ~5% at the mid kv_len~512 range.
+_DECODE_BLOCK_N = 16
+_DECODE_NUM_WARPS = 1
+_DECODE_NUM_STAGES = 2
 
 
-@triton.autotune(configs=_decode_configs(), key=["D"])
 @triton.jit
 def _flash_decode_fwd(
     q_ptr, k_ptr, v_ptr, o_ptr, kvlen_ptr, sm_scale,
@@ -149,6 +154,7 @@ def attention_flash_decode(
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         out.stride(0), out.stride(2), out.stride(3),
         Hq, KV_GROUP,
-        D=D,
+        BLOCK_N=_DECODE_BLOCK_N, D=D,
+        num_warps=_DECODE_NUM_WARPS, num_stages=_DECODE_NUM_STAGES,
     )
     return out

@@ -156,7 +156,7 @@ class SwiGLUMLP(nn.Module):
         if USE_TRITON and x.is_cuda:
             from kernels.w8a16_gemm_kernel import w8a16_linear_triton
             from kernels.w8a8_gemm_kernel import (
-                w8a8_linear_triton, w8a8_swiglu_prequant,
+                w8a8_linear_triton, w8a8_swiglu_prequant, w8a8_down_linear,
             )
             # --- 1+2. Fused gate+up (W8A8 int8 tensor cores) + SwiGLU ---
             # gate_up is the single dominant decode GEMM (N=28672). Its input is
@@ -183,7 +183,19 @@ class SwiGLUMLP(nn.Module):
                 from kernels.swiglu_kernel import swiglu_triton
                 fused = swiglu_triton(gate, up)
 
-            # --- 3. Down projection (int8 weights) ---
+            # --- 3. Down projection ---
+            # down is the dominant decode GEMM. Its 58.7 MB int8 weight fits Ada's
+            # 96 MB L2, so it is compute/L2-bound and the int8 tensor cores (~2x
+            # bf16) pay off: W8A8 runs the GEMM ~1.9x faster than the W8A16
+            # (weight-int8, bf16-MMA) path. The SwiGLU output has no free per-row
+            # int8 quant (it is not produced by a norm), so the W8A8 path pays a
+            # standalone per-token quant; net it still wins in the decode bucket.
+            # b1 (M<=16) and prefill (M>256) keep W8A16 (no int8-MMA win there).
+            # The standalone per-token quant (K=14336) only amortises once M is
+            # large enough to fill the SMs: it wins at M>=128 (the b128 headline)
+            # but loses at M=32/64, so the down W8A8 bucket starts above 64.
+            if 64 < M <= 256:
+                return w8a8_down_linear(fused, self.w_down_int8, self.w_down_scale)
             return w8a16_linear_triton(fused, self.w_down_int8, self.w_down_scale)
 
         # Reference / CPU fallback: dequantize weights to x.dtype, then dense MLP.

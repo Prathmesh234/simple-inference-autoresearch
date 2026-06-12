@@ -411,3 +411,141 @@ win needs FREE activation quant, which o_proj cannot get:
    for free. gate_up/qkv/lm_head (norm inputs) are all W8A8 now; down (swiglu-output
    outliers, faithfulness rel_err~26) and o_proj (attention output, cross-head scale)
    are blocked. The decode GEMM W8A8 conversion is COMPLETE.
+
+## EXP-L — flash_decode: hardcode config (BLOCK_N=16, num_warps=1), remove autotune — KEEP
+The decode attention kernel (kernels/flash_decode_kernel.py) used
+`@triton.autotune(key=["D"])`. D=128 is constant, so the autotuner runs do_bench
+ONCE on the first call's shape and caches that config for every later shape. In a
+full sweep the first decode call is chat b1 (32 programs), so the cached config is
+tuned for B*Hq=32 and then reused for the instruct b128 headline (B*Hq=4096) — a
+slow fit: baseline full-sweep flash_decode = 138us/call (15.06% of decode). It also
+varied run-to-run (iso 57-95us) because do_bench is noisy, polluting every A/B, and
+a do_bench inside the decode path is unsafe under CUDA-graph capture (alloc+sync).
+A direct config sweep of the headline shape (workspace/scripts/bench_flash_decode_cfg.py,
+calling `_flash_decode_fwd.fn` to bypass the autotuner) found num_warps=1 is fastest
+at every length tested (kv93 24.3us, kv512 314us, kv2048 1601us) — each program is a
+tiny single-query attention, so minimal warps = maximal occupancy. The old autotune
+list only offered num_warps>=2, so it could NEVER reach the best config. BLOCK_N=16
+is best at the short headline kv_len AND at long contexts (kv2048), ~5% off only at
+the mid kv~512 range. Hardcoded BLOCK_N=16, num_warps=1, num_stages=2; removed the
+autotune entirely (aligns with the CHECKPOINT rule "no autotune in the decode path").
+Numerics vs SDPA reference: rel_err ~3e-3 (bf16-level) across kv 40..2000. b1 decode
+is config-insensitive (~22.7us flat) so single-stream is unaffected.
+Result (full sweep): _flash_decode_fwd 138us -> 58.7us = 2.35x (15.06% -> 6.55%).
+best_agg_tps 5852.1 -> 6123.5 = +4.6% headline. seq_tps_b1 94.9 -> 94.5 (neutral).
+peak_vram 38.53 unchanged. KEEP. New dominant op: down _w8a16_gemm 48.17%.
+
+## EXP-M — down_proj W8A8 (b128 decode bucket) — KEEP (+21.6%, the big one)
+This OVERTURNS the EXP-K "down W8A8 is DEAD / decode GEMM W8A8 is COMPLETE" verdict.
+Two prior blockers, both re-examined:
+
+(1) FAITHFULNESS — prior "RTN rel_err~26" was PER-TENSOR quant. With PER-TOKEN
+    (per-row) int8 act quant (what the _quant_per_token kernel actually does), the
+    down GEMM rel_err on REAL post-SwiGLU activations (8 generic calib prompts, 32
+    layers, workspace/scripts/probe_down_smoothquant.py) is only ~0.070 naive /
+    ~0.038 SmoothQuant a=0.7 — at/below the accepted gate_up W8A8 band (~0.06).
+    End-to-end teacher-forced next-token agreement vs bf16 (probe_down_w8a8_e2e.py):
+    W8A16 100% | naive W8A8 93.8% | SQ a=0.7 97.2% (gate_up bf16). Greedy generation
+    with the REAL engine (naive W8A8 down, B=128) is fully coherent and factually
+    correct (Paris; Rayleigh scattering; Newton's laws) — program.md coherence gate
+    PASSED with naive, so SmoothQuant was NOT needed to ship.
+
+(2) "FREE QUANT REQUIRED" PRINCIPLE — falsified for down. The EXP-K principle said a
+    decode GEMM can only go W8A8 if a preceding norm yields the int8 quant for free.
+    down's input is the SwiGLU output (no per-row pass), so it pays a standalone
+    _quant_per_token (~15us at K=14336). That principle held for o_proj because its
+    GEMM win was small (1.30x). down is different: its 58.7 MB int8 weight FITS Ada's
+    96 MB L2, so the GEMM is compute/L2-bound (not HBM-bound) and int8 tensor cores
+    give a ~1.9x GEMM win that DWARFS the quant cost. Lesson: the standalone-quant tax
+    is worth paying when the L2-resident weight makes the int8-MMA win big.
+
+MECHANISM / TUNING:
+- The generic W8A8 tile (128,128,128 — what made earlier "down W8A8 dead" benches show
+  0.65-0.77x) is wrong for down's huge K=14336. A tile sweep at M=128,K=14336,N=4096
+  found BM=64,BN=64,BK=256,nw=4,ns=4,GROUP_M=8: int8 GEMM 50.2us vs W8A16 95.5us =
+  1.90x (below the 61us HBM floor -> confirms L2-resident, not HBM-bound). Same
+  "wrong tile hid the win" lesson as EXP-G/qkv.
+- Net standalone incl. the per-token quant (15.5us): M=128 -> 1.19x, M=256 -> 1.45x;
+  M=32/64 LOSE (quant under-occupied), so dispatch is 64<M<=256 only. b1/prefill keep
+  W8A16. New kernel: kernels/w8a8_gemm_kernel.py::w8a8_down_linear. Standalone gate:
+  benchmarks/benchmark_kernel/bench_w8a8_down_compare.py.
+
+RESULT (full sweep): instruct b128 decode 20.9ms -> 17.19ms. best_agg_tps
+6123.5 -> 7445.0 = +21.6% headline. seq_tps_b1 94.5 -> 94.4 (neutral, b1 = W8A16).
+peak_vram 38.53 unchanged. In-graph op table: _w8a8_gemm calls 2016 -> 4032 (qkv+down),
+_w8a16_gemm calls collapse to lm_head/b1/prefill. KEEP.
+NEXT: down is no longer the elephant; gate_up _w8a8_swiglu_fwd (24%) and the remaining
+_w8a8_gemm are now the largest. Consider fusing the down quant into the swiglu epilogue
+(atomic per-row amax) to reclaim the ~15us standalone quant, and/or SmoothQuant a=0.7
+folding for extra faithfulness margin.
+
+## EXP-N — o_proj W8A8 (b128 decode bucket) — KEEP (+7.6%)
+OVERTURNS the EXP-K "o_proj W8A8 is DEAD" verdict, exactly like EXP-M did for down.
+EXP-K killed o_proj on two grounds — both wrong:
+
+(1) "GEMM only 1.30x" — a WRONG-TILE artifact (the same lesson as EXP-G/qkv and
+    EXP-M/down). A tile sweep at the real decode shape (M=128, K=N=4096) found
+    BM=32,BN=64,BK=256,nw=4,ns=2,GROUP_M=8: int8 GEMM 24.0us vs bf16 cuBLAS 50.7us =
+    2.11x. o_proj's 16.7 MB int8 weight is L2-resident on Ada (96 MB L2), so the GEMM
+    is compute/L2-bound and the int8 tensor cores (~2x bf16) pay off — even more so
+    than down (smaller weight, more L2-resident).
+
+(2) "free quant required / quant occupancy-starved" — the per-token _quant_per_token
+    of the attention output (no preceding per-row norm) is ~14us standalone. KEY
+    FINDING: that ~14us is CONSTANT across K=4096 and K=14336 (3.5x the data) and
+    across num_warps -> it is LAUNCH/occupancy-bound, NOT execution-bound. Inside the
+    captured CUDA decode graph (replay skips launch overhead) that cost largely
+    vanishes, which is why the in-graph win (+7.6%) DWARFS the standalone net the
+    wall-clock bench shows (the standalone bench compares a 2-launch Triton path
+    against single-launch cuBLAS, so it under-reports — use CUDA-event device time).
+
+(3) "cross-head scale" faithfulness — the per-token scale spans all Hq*D=4096 (all
+    heads share one scale). FALSIFIED qualitatively: greedy generation with the REAL
+    engine (B=128, both down + o_proj W8A8) is fully coherent and factually correct
+    (Paris; Rayleigh scattering; cookie recipe; Newton's laws). rel_err 1.2e-2 vs bf16.
+
+MECHANISM / TUNING:
+- New kernel kernels/w8a8_gemm_kernel.py::w8a8_oproj_linear (self-quant + tuned tile
+  32/64/256/nw4/ns2). Dispatch in ops/attention.MultiHeadAttention._decode_graph_forward
+  for 64<M<=256; b1 and prefill keep bf16 cuBLAS (self.wo Parameter retained). Weight
+  quantized to int8 buffers (w_o_int8 / w_o_scale) at load_weights.
+- Standalone gate: benchmarks/benchmark_kernel/bench_w8a8_oproj_compare.py (faithfulness
+  rel_err 1.2e-2; standalone wall-clock under-reports speed — see note above).
+
+RESULT (full sweep): best_agg_tps 7445.0 -> 8009.5 = +7.6% headline; confirmation run
+8044.7 (stable, ~0.4% apart). seq_tps_b1 94.4 (neutral, b1 = bf16). peak_vram
+38.53 -> 39.07 (+0.54 GB int8 o_proj buffer, in budget). KEEP.
+NEXT: with qkv, gate_up, down, lm_head AND o_proj all int8, every major decode GEMM is
+now W8A8. flash_decode (already tuned) and the per-token quant launches are the only
+remaining non-int8 decode work. The launch-bound quant insight (~14us, hidden in-graph)
+explains why both down and o_proj won bigger in-graph than standalone — future quant
+fusion (e.g. into the flash_decode epilogue) is low-value since the cost is graph-hidden.
+
+## EXP-O — W4A8 grouped-int4 gate_up (the HBM-bound elephant) — DISCARD (standalone 0.90x)
+HYPOTHESIS: gate_up is the biggest decode op (~25%) and its 117 MB int8 weight exceeds
+Ada's 96 MB L2, so the fused W8A8 swiglu should be HBM-bound; packing the weight to
+4-bit (59 MB, also L2-resident) would halve the weight read and approach ~2x.
+
+FAITHFULNESS — PASSES (overturns the old "int4 gate_up dead (faith)" verdict, which
+used per-tensor/per-channel int4). Per-GROUP int4 (group=64 along K):
+- faith_gateup_int4.py: final-token argmax agreement g=64/g=32 = 1.000 (g=128 = 0.833),
+  though logit_rel ~0.24-0.28 and top5 overlap ~0.6-0.7 (looser than down/o_proj).
+- coherence_gateup_int4.py: REAL-engine greedy generation at g=64 is fully coherent and
+  factually correct (Paris/Washington/London/Ottawa/Moscow/Rome capitals; Rayleigh
+  scattering; Newton's laws). So faithfulness is NOT the blocker.
+
+KERNEL PERF — FAILS (the real blocker). Built kernels/w4a8_swiglu_kernel.py: split-half
+int4 packing (byte holds K-elem j low-nibble + j+32 high-nibble within each 64-group),
+grouped fused GEMM+SwiGLU with int8 activation, int32 dot per group scaled by the
+per-group weight scale into an fp32 accumulator. Numerically correct (rel 1.4e-2 vs the
+grouped-int4 dequant reference) BUT slower: best tuned config (BM128/BN64/nw4/ns2) =
+175us vs 158us W8A8 = 0.90x; default 197us = 0.80x.
+WHY: gate_up W8A8 (158us) is only ~1.3x above the 122us HBM floor (117MB/960GB/s) — it
+is NOT strongly HBM-bound at M=128, so halving the weight read saves little, and the
+int4 unpack (mask/shift/sign-extend) + per-group fp32 rescale (64 groups x (128x64)
+FMA x2) + small per-group dots OUTWEIGH the HBM savings. A production low-bit kernel
+(Marlin/AWQ-style layout + pipelining) might win, but that is far beyond scope and the
+hand-rolled Triton path clearly loses here.
+VERDICT: DISCARD. Removed the un-wired kernel + bench. Kept the faith/coherence scripts
+as evidence. NEW CONFIRMED-DEAD entry: W4A8 grouped gate_up (kernel overhead-bound; the
+op is only ~1.3x above HBM floor, not HBM-bound enough to pay for int4 unpack+regroup).

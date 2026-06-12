@@ -19,4 +19,3 @@ metrics/
 # Autoresearch experiment log + run output (kept untracked per program.md)
 results.tsv
 run.log
-workspace/
