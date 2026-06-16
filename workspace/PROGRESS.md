@@ -5,9 +5,6 @@ Goal: maximize `best_agg_tps` (aggregate decode tok/s) without collapsing
 seq_tps_b1 (batch-1 latency) or blowing VRAM (<~48GB). Output must stay coherent.
 Hardware: RTX 6000 Ada, 48GB, ~960 GB/s BW, ~1457 TFLOPS bf16.
 
-## Git identity (REQUIRED for every commit)
-    git config user.name  "Prathmesh234"
-    git config user.email "ppbhatt500@gmail.com"
 (Commits also append the
  `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>` trailer.)
 
