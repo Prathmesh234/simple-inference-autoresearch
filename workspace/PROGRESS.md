@@ -686,3 +686,19 @@ on the SAMPLE ops (topk/multinomial allocations, which profile_memory=True taxes
 sample() is called EXTERNALLY by the profiler so it can't move into the graph. git reset.
 LESSON: eager-op COUNT reduction only helps when the eager ops are expensive/allocating;
 the per-step pos buffers are too cheap to matter.
+
+## EXP-10 — defer temperature divide past top-k — KEEP (neutral b128, simplification)
+apply_temperature did logits/T over the FULL (B,128256) vocab every step (aten::div,
+~32MB alloc) before top-k. Temperature is monotonic so top-k(logits/T)==top-k(logits)
+and top-k(logits)/T==top-k(logits/T); the fast path now top-ks RAW logits and divides
+only the 50 candidates. Bit-faithful (max|Δprob|=0.0 vs float32 ref, sampling gate PASS).
+RESULT: 9692.3 -> 9692.1 (FLAT) — the div was cheap/overlapped, not on the critical path
+and not a big profiler-tax source. KEPT as a strict simplification (removes a full-vocab
+op + its 32MB/step alloc; helps b1/low-batch margin where sampling is a larger fraction;
+zero downside). aten::div confirmed gone from the op table.
+
+## jun27 cumulative: 9393 -> 9692 (+3.2%). Real wins: EXP-1 swiglu BK=256 (+2.3%),
+EXP-8 strided-rope drop-copies (+0.86%). Neutral-kept: EXP-10. Dead: EXP-2..7,9.
+Fresh decode op table (13.2ms/step): gate_up swiglu 38%, _w8a8_gemm(qkv+down+o_proj+lmhead)
+38%, flash 10.6%, norms/quant/rope/kv-write/sampling ~10%. All at int8/floor limits.
+The two GEMM groups (76%) are the wall; "other" (24%) is near memory/compute floors.
