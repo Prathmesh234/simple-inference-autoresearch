@@ -626,3 +626,16 @@ agg). KV-int8 / FP8-KV dead at short context (L2-resident). Remaining ideas are 
 <1-2% or faith/profiler-blocked: sampling-in-graph (~1%, graph-safe-RNG risk),
 down/o_proj quant fusion (blocked by per-row-amax-across-tiles), first-layer-qkv W8A8
 (~0.2%). Engine is near-optimal for this metric.
+
+## EXP-6 — split-K for the W8A8 o_proj/down GEMMs — DEAD (atomic reduction dominates)
+o_proj (33us vs 6us int8-compute floor) and down (47us vs 20us) sit far above their
+floors -> hypothesised occupancy/latency-bound (~128 programs on 142 SMs = ~1 wave,
+serial K-loop latency unhidden), and int8 MMA (2x faster than the old W8A16 these were
+split-K-tested on) makes K-loop latency a bigger fraction. Built a W8A8 split-K kernel
+(SPLIT_K programs each reduce a K-chunk to int32, atomic-add the SCALED fp32 partial;
+correct, rel=0). RESULT: 0.08-0.31x (catastrophically SLOWER) — the fp32 atomic_add
+reduction over the M*N output (1M+ atomics) dominates any occupancy gain. Confirms the
+prior "split-K DEAD" for W8A8 too. Also: EXP-3 already showed BLOCK_N=32 (more programs,
+2 waves) doesn't beat BLOCK_N=64 for o_proj/down -> they are NOT fixably occupancy-bound;
+33/47us are the genuine Triton int8-GEMM floors at M=128 for these shapes. GEMM axis
+fully closed.
