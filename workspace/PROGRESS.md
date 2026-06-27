@@ -639,3 +639,21 @@ prior "split-K DEAD" for W8A8 too. Also: EXP-3 already showed BLOCK_N=32 (more p
 2 waves) doesn't beat BLOCK_N=64 for o_proj/down -> they are NOT fixably occupancy-bound;
 33/47us are the genuine Triton int8-GEMM floors at M=128 for these shapes. GEMM axis
 fully closed.
+
+## EXP-7 — re-sweep flash_decode config at headline kv_len — confirmed optimal
+flash_decode is 10% of decode and ~6.7x above its L2-read floor (scalar GEMV-style
+online softmax, nw=1). Re-swept BLOCK_N{8,16,32,64} x nw{1,2,4} x ns{1,2,3} at the
+headline shape. At kv_len 64/93 (instruct prompt~29 -> 29+64) the current EXP-L config
+(BLOCK_N=16,nw=1,ns=2) is within 1.005-1.011x of the best = optimal. (At kv_len=128,
+ns=1 wins ~1.10x, but instruct decode never reaches kv_len 128, so irrelevant.) No
+actionable win. flash_decode is done.
+
+## ============ jun27 FINAL STATE ============
+Banked: EXP-1 swiglu BLOCK_K=256/nw8, +2.30% (9393.0 -> 9609.7), pushed. Every other
+decode component re-verified optimal or measured-dead this session (EXP-2..7). The b128
+single-token decode is at its practical Triton optimum: gate_up/lm_head HBM-bound (int4
+faith+kernel dead), qkv/down/o_proj/flash L2-resident compute-bound (tiles optimal,
+split-K dead), KV-int8 L2-dead at short ctx, sampling optimal. Structural levers
+(spec-decode, paging, higher batch, sampling-in-graph) are incompatible with the fixed
+profiler (1 token/model-call, external sample(), b128 cap). Remaining ideas all <~1.5%
+and/or blocked (see CHECKPOINT "Next-session levers").
