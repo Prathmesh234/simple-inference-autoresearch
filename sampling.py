@@ -160,8 +160,6 @@ def sample(
     if temperature == 0:
         return greedy(logits)
 
-    logits = apply_temperature(logits, temperature)
-
     vocab = logits.shape[-1]
     if 0 < top_k < vocab:
         # Fast path: when top-k is active, the only tokens that can ever be
@@ -181,7 +179,11 @@ def sample(
         # top-k semantics, immaterial to output quality.)
         vals, idx = torch.topk(logits, top_k, dim=-1, largest=True, sorted=True)
 
-        vals = vals.float()
+        # Temperature is a strictly monotonic scaling, so top-k(logits/T) picks
+        # the SAME k indices as top-k(logits) and top-k(logits)/T == top-k(logits/T).
+        # We therefore top-k the RAW logits and divide only the k candidates by T,
+        # skipping a full-vocab (B, 128k) divide and its ~32MB alloc every step.
+        vals = vals.float() / temperature
         if top_p < 1.0:
             # Nucleus filter over the k candidates, in float32. The old path made
             # this cumulative-probability decision in bf16 over the full sorted
@@ -199,7 +201,9 @@ def sample(
         choice = torch.multinomial(probs, num_samples=1)  # (B, 1) index in [0, k)
         return idx.gather(-1, choice).squeeze(-1)
 
-    # No top-k bound: fall back to the full-vocab path.
+    # No top-k bound: fall back to the full-vocab path (temperature must be
+    # applied over the whole vocab here since there is no top-k to defer it past).
+    logits = apply_temperature(logits, temperature)
     if top_p < 1.0:
         logits = filter_top_p(logits, top_p)
 
