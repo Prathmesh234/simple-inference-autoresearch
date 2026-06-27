@@ -675,3 +675,14 @@ RESULT: full sweep 9609.7 -> 9692.3 (+0.86%); decode_ms 13.32->13.21; seq_tps_b1
 neutral; vram unchanged. Above both prior with-copies runs (9609.7, 9575.0). KEEP.
 Cumulative jun27: 9393 -> 9692 (+3.2%). NEXT: the 0.54ms eager-op profiler tax — move the
 cos/sin/kv_len derivation from pos_index INTO the graph (cut _update_pos 4 eager ops -> 1).
+
+## EXP-9 — derive cos/sin/kv_len from pos_index inside the graph — DISCARD (flat)
+Hypothesis: the 0.54ms profiler tax (clean b128 12.62ms vs profiled 13.17ms) is eager-op
+launch overhead; _update_pos did 4 eager writes/step (pos/kv_len/cos/sin). Moved kv_len
+(=pos+1) + cos/sin (index_select) derivation INTO the captured graph, leaving only
+pos_index.fill_ eager. Correct (coherent greedy: "first three primes are 2,3,5"). RESULT:
+9692.3 -> 9681.5 (FLAT, within noise). The tax is NOT on the tiny pos/cos/sin copies; it's
+on the SAMPLE ops (topk/multinomial allocations, which profile_memory=True taxes) — and
+sample() is called EXTERNALLY by the profiler so it can't move into the graph. git reset.
+LESSON: eager-op COUNT reduction only helps when the eager ops are expensive/allocating;
+the per-step pos buffers are too cheap to matter.
