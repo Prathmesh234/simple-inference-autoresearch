@@ -702,3 +702,18 @@ EXP-8 strided-rope drop-copies (+0.86%). Neutral-kept: EXP-10. Dead: EXP-2..7,9.
 Fresh decode op table (13.2ms/step): gate_up swiglu 38%, _w8a8_gemm(qkv+down+o_proj+lmhead)
 38%, flash 10.6%, norms/quant/rope/kv-write/sampling ~10%. All at int8/floor limits.
 The two GEMM groups (76%) are the wall; "other" (24%) is near memory/compute floors.
+
+## EXP-11 — skip the dead bf16 normed write in the W8A8 bucket — KEEP (+0.62%)
+add_rmsnorm_quant emits (bf16 normed, new_r, int8, scale). In the W8A8 decode bucket
+(16<M<=256) the qkv/gate_up GEMMs read ONLY int8+scale; the bf16 normed is consumed
+solely by the b1/prefill W8A16 fallback -> dead traffic (1MB/row x ~63 norms/step = 63MB).
+Gated the bf16 store behind EMIT_BF16 constexpr; block.forward passes
+emit_bf16=not(16<M<=256). Returned bf16 tensor stays allocated (no kernel) as a
+valid-shape placeholder; its data is unused downstream in the bucket (verified: B=35
+emit_bf16=False greedy is coherent — 2+2=4, water boils 100C, hot/cold; B=1 unchanged).
+RESULT: 9692 -> 9752.4 (+0.62%); decode_ms 13.207->13.125 (-0.08ms ~= 63MB/960GBps);
+seq_tps_b1 94.6 neutral. NOTE: the norm kernel's own self-time is UNCHANGED (5.61us,
+latency-bound: 128 rows x 4096 reduction, the write was overlapped) — the win is the freed
+HBM WRITE bandwidth reducing contention on the L2/HBM-bound GEMMs. KEEP. Cumulative jun27:
+9393 -> 9752 (+3.8%). Real wins: EXP-1 swiglu BK256 (+2.3%), EXP-8 strided-rope (+0.86%),
+EXP-11 dead-bf16-write (+0.62%).
