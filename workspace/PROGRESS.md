@@ -657,3 +657,21 @@ split-K dead), KV-int8 L2-dead at short ctx, sampling optimal. Structural levers
 (spec-decode, paging, higher batch, sampling-in-graph) are incompatible with the fixed
 profiler (1 token/model-call, external sample(), b128 cap). Remaining ideas all <~1.5%
 and/or blocked (see CHECKPOINT "Next-session levers").
+
+## EXP-8 — strided-input RoPE: eliminate the q/k .contiguous() copies — KEEP (+0.86%)
+The clean-vs-profiled probe (clean_vs_profiled_b128.py) showed clean b128 decode=12.62ms
+(agg 10141) vs profiled 13.17ms — a 0.54ms (4.3%) profiler tax on eager ops, AND that the
+op table's 4096-call `elementwise<128,4>` is the q/k `.contiguous()` copies the RoPE
+wrapper forced: the fused-qkv GEMM emits one contiguous (B,T,6144) buffer; q=[:4096],
+k=[4096:5120] are NON-contiguous slices (row stride 6144), and _apply_qk copied them. The
+RoPE kernel now reads Q/K with an explicit input row stride (no copy), writing contiguous
+output. BIT-IDENTICAL (dq=dk=0, parity_rope_strided_jun27.py).
+GOTCHA (cost a wasted run): the first cut gated on stride(0)==T*stride(1) — FALSE for the
+T==1 decode slice (q.stride()==(6144,4096,128,1): the real batch stride is stride(0)=6144,
+not stride(1)=4096 which is the singleton T-dim's natural n_heads*head_dim). So it fell
+back to .contiguous() (measured no-op, 9575~=baseline). Fix: for T==1 the row stride is
+stride(0). Then the plain `elementwise<128,4>` (4096 calls) VANISHES from the op table.
+RESULT: full sweep 9609.7 -> 9692.3 (+0.86%); decode_ms 13.32->13.21; seq_tps_b1 94.7
+neutral; vram unchanged. Above both prior with-copies runs (9609.7, 9575.0). KEEP.
+Cumulative jun27: 9393 -> 9692 (+3.2%). NEXT: the 0.54ms eager-op profiler tax — move the
+cos/sin/kv_len derivation from pos_index INTO the graph (cut _update_pos 4 eager ops -> 1).
