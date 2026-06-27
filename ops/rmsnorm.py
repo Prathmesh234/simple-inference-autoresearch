@@ -81,7 +81,7 @@ class RMSNorm(nn.Module):
             self.weight.copy_(weight)
 
     def add_norm_quant(
-        self, hidden: torch.Tensor, residual: torch.Tensor
+        self, hidden: torch.Tensor, residual: torch.Tensor, emit_bf16: bool = True
     ):
         """Fused residual-add + RMSNorm that ALSO emits a per-token int8
         quantization of the normed output (EXP-D).
@@ -95,6 +95,8 @@ class RMSNorm(nn.Module):
         """
         if USE_TRITON and hidden.is_cuda:
             from kernels.add_rmsnorm_kernel import add_rmsnorm_quant_triton
-            return add_rmsnorm_quant_triton(hidden, residual, self.weight, self.eps)
+            return add_rmsnorm_quant_triton(
+                hidden, residual, self.weight, self.eps, emit_bf16=emit_bf16
+            )
         new_residual = residual + hidden
         return _pytorch_rmsnorm(new_residual, self.weight, self.eps), new_residual, None, None

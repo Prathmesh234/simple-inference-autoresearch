@@ -178,6 +178,7 @@ def _add_rmsnorm_quant_fwd(
     stride_h, stride_r, stride_o,
     N, eps,
     BLOCK_SIZE: tl.constexpr,
+    EMIT_BF16: tl.constexpr,
 ):
     pid = tl.program_id(0)
     h_row     = h_ptr + pid * stride_h
@@ -198,7 +199,12 @@ def _add_rmsnorm_quant_fwd(
     var = tl.sum(xf * xf, axis=0) / N
     rms = tl.rsqrt(var + eps)
     out = xf * w * rms
-    tl.store(out_row + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
+    # The bf16 normed output is consumed ONLY by the W8A16 fallback (b1 decode /
+    # prefill). In the W8A8 decode bucket (16<M<=256, the b128 headline) the GEMMs
+    # read only the int8 (qi) + scale (qs) below, so the 1 MB/row bf16 store is dead
+    # traffic — skip it (EMIT_BF16=False), shaving ~1 MB write per norm (~63/step).
+    if EMIT_BF16:
+        tl.store(out_row + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
 
     # Fused per-token symmetric int8 quant of the normed row (same math as
     # kernels/w8a8_gemm_kernel._quant_per_token, but the data is already here).
@@ -215,6 +221,7 @@ def add_rmsnorm_quant_triton(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-5,
+    emit_bf16: bool = True,
 ):
     """add_rmsnorm that ALSO returns a per-token int8 quantization of the normed
     output for the W8A8 gate_up GEMM.
@@ -233,6 +240,10 @@ def add_rmsnorm_quant_triton(
     n_rows, N = h_2d.shape
     BLOCK_SIZE = triton.next_power_of_2(N)
 
+    # `out` (bf16 normed) is allocated for its shape/dtype but, when emit_bf16 is
+    # False (the W8A8 decode bucket), the kernel skips writing it — the returned
+    # tensor is a valid-shape placeholder whose DATA is unused downstream (the GEMM
+    # reads qi/qs). torch.empty launches no kernel, so this costs no GPU traffic.
     out = torch.empty_like(h_2d)
     new_r = torch.empty_like(h_2d)
     qi = torch.empty((n_rows, N), dtype=torch.int8, device=h_2d.device)
@@ -244,5 +255,6 @@ def add_rmsnorm_quant_triton(
         h_2d.stride(0), r_2d.stride(0), out.stride(0),
         N, eps,
         BLOCK_SIZE=BLOCK_SIZE,
+        EMIT_BF16=emit_bf16,
     )
     return out.reshape(orig_shape), new_r.reshape(orig_shape), qi, qs

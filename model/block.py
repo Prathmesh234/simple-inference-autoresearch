@@ -145,6 +145,14 @@ class TransformerBlock(nn.Module):
             still pending, to be folded into the next norm); residual is the
             stream after the attention add.
         """
+        # In the W8A8 decode bucket (16 < M <= 256, the b128 headline) the qkv and
+        # gate_up GEMMs consume only the int8 activation + scale that the fused norm
+        # emits, so the norm's bf16 normed output is dead — tell add_norm_quant to
+        # skip that 1 MB/row store. Outside the bucket (b1 / prefill) the W8A16
+        # fallback reads the bf16 normed, so it must still be written.
+        M = x.shape[0] * x.shape[1]
+        emit_bf16 = not (16 < M <= 256)
+
         # --- 1. Attention block ---
         # First block: no pending add, just normalize and seed the residual (kept
         # on the W8A16 qkv path — one of 32 layers, not worth a residual-less
@@ -156,7 +164,8 @@ class TransformerBlock(nn.Module):
             h = self.attn_norm(x)
             h_int8, h_scale = None, None
         else:
-            h, residual, h_int8, h_scale = self.attn_norm.add_norm_quant(x, residual)
+            h, residual, h_int8, h_scale = self.attn_norm.add_norm_quant(
+                x, residual, emit_bf16=emit_bf16)
         h = self.attn(h, start_pos=start_pos, kv_cache=kv_cache,
                       decode_ctx=decode_ctx, x_int8=h_int8, x_scale=h_scale)
 
@@ -164,7 +173,8 @@ class TransformerBlock(nn.Module):
         # Fold the attention residual add into the pre-MLP norm, and (EXP-D)
         # the per-token int8 activation quant for the W8A8 gate_up GEMM, so no
         # standalone quant kernel runs on the decode hot path.
-        h, residual, h_int8, h_scale = self.mlp_norm.add_norm_quant(h, residual)
+        h, residual, h_int8, h_scale = self.mlp_norm.add_norm_quant(
+            h, residual, emit_bf16=emit_bf16)
         h = self.mlp(h, x_int8=h_int8, x_scale=h_scale)
 
         # h's residual add stays pending — resolved by the next block's
