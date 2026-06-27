@@ -546,3 +546,83 @@ hand-rolled Triton path clearly loses here.
 VERDICT: DISCARD. Removed the un-wired kernel + bench. Kept the faith/coherence scripts
 as evidence. NEW CONFIRMED-DEAD entry: W4A8 grouped gate_up (kernel overhead-bound; the
 op is only ~1.3x above HBM floor, not HBM-bound enough to pay for int4 unpack+regroup).
+
+---
+
+# ============ SESSION jun27 (branch autoresearch/jun27, fresh box) ============
+Box reads HIGHER than jun11: baseline full-sweep best_agg_tps=9393.0 (vs jun11's
+8009). Compare WITHIN jun27 only. Re-traced the op table fresh (instruct b128,
+per 13.6ms decode step): gate_up swiglu 5.36ms (39%), qkv+down+o_proj _w8a8_gemm
+4.99ms (37%), flash_decode 1.39ms (10%), norms/quant/rope/KV-write ~1.1ms (8%),
+sampling ~0.35ms (3%). (The _w8a16_gemm 365ms in the raw table is PREFILL — 96
+GEMMs @ M=3712 + the 63 first-layer-qkv W8A8-ineligible decode calls; NOT decode.)
+Call-count decode breakdown of _w8a8_gemm (6048 calls): qkv 1953 (layer0 is W8A16)
++ down 2016 + o_proj 2016 + lm_head 63. So lm_head (~600us/call, 525MB HBM) is
+~4.5% of decode hidden inside _w8a8_gemm; down is the biggest single GEMM (~11%).
+
+## EXP-1 — gate_up swiglu BLOCK_K 128->256, num_warps 4->8 — KEEP (+2.3%)
+gate_up is the biggest decode op; 117MB int8 weight > 96MB L2 => HBM-bound (122us
+floor) and sat at 167.5us in-graph (~45us un-hidden int8 MMA). Widening BLOCK_K
+128->256 (half the K-loop trips, wider weight loads) + num_warps 4->8 (spreads the
+two int32 accumulators over more threads, eases the register pressure that pins
+BLOCK_N=64) hides more MMA under the weight stream. Standalone (tune_swiglu_jun27.py):
+147.1us vs 156.0us = 1.06x, bit-identical (rel_err=0). ns>=3 fails (>128KB smem at
+BK=256). Only w8a8_swiglu_prequant's launch config changed. Iso A/B 9565.6->9819.7
+(+2.66%); full sweep 9393.0->9609.7 (+2.30%); swiglu op 167.5->158.3us/call.
+seq_tps_b1 neutral (94.8). Commit 70d1793, pushed. NEW BASELINE.
+
+## EXP-2 — int8 KV cache — DISCARD for the headline (MEASURED, overturns nothing)
+Built kernels/flash_decode_int8_kernel.py (int8 K/V + per-(b,head,pos) fp32 scale,
+dequant folded into online softmax) + standalone gate (bench_flash_int8_jun27.py).
+The jun11 "KV-int8 dead" was an unmeasured analogy to the L2-resident weights; I
+hypothesised flash_decode is KV-bandwidth-bound and re-tested. RESULT: faithfulness
+EXCELLENT (rel_err ~0.017, cos 0.99998 — attention is a weighted avg, robust to KV
+quant), BUT speed at the SHORT instruct headline LOSES: kv_len 32:0.96x 64:0.88x
+128:0.80x | only wins at 256:2.40x 512:1.62x 1024:1.40x. MECHANISM: at b128 short
+context the K+V cache (~32MB at kv_len=64) FITS the 96MB L2 -> flash_decode is
+L2/compute-bound, NOT HBM-bound -> halving bytes is a no-op and the extra scale
+loads + dequant FMA make it slower. So jun11 was RIGHT for the headline (now with
+the correct mechanism: L2-resident short-context KV, same L2 insight as weights).
+int8 KV helps long-context + halves KV VRAM, but long flavors never beat instruct's
+b128 agg (longer KV = slower). NOT wired (simplicity). Kernel+bench kept as evidence.
+CONFIRMED-DEAD for the b128 headline.
+
+## EXP-3 — re-sweep qkv/down/o_proj _w8a8_gemm tiles — no win (tiles optimal)
+Applied the EXP-1 "wrong-tile/un-swept-dim" lever to the other GEMMs
+(tune_w8a8_gemm_jun27.py, MIN-of-many at real decode shapes). qkv (128,64,128,8,3)
+optimal (best alt 0.996x); down (64,64,256,4,4) optimal (all alts slower); o_proj
+best alt (64,64,256,4,4)=1.036x — SUB-NOISE (o_proj ~7% of decode -> 0.26% headline;
+EXP-H lesson: sub-2% standalone washes out). The BLOCK_K=256 win is SPECIFIC to the
+HBM-bound gate_up (hides compute under the weight stream); the L2-resident
+compute-bound GEMMs (qkv/down/o_proj) don't have that lever. GEMM-tile axis exhausted.
+
+## EXP-4 — lm_head tile + rope config probes — no win
+(a) lm_head W8A8 GEMM (HBM-bound like gate_up): best (128,256,256,8,2)=655us vs
+current (128,128,128,4,2)=683us = 1.042x (== the EXP-H config already DISCARDED for
+washing out). 4.5%-of-decode op -> 0.19% headline. SUB-NOISE.
+(b) rope: standalone "autotuned" 51us vs hardcoded nw1 24us looked like 2.16x, but
+that gap is ALLOCATION+wrapper overhead, not the kernel — the in-graph rope SELF-time
+is only 5.79us/call (1.4% of decode, ~2x above its 2.6us BW floor). rope autotune
+keys on (HALF,INTERLEAVED) and per-program work is shape-independent (64-wide rotate),
+so the cached config is fine for decode (unlike flash_decode EXP-L where config
+depended on B*Hq). No real lever.
+
+## EXP-5 — gate_up FUSED vs 2 single-acc GEMMs + swiglu — fused confirmed optimal
+Tested whether the 2-accumulator fusion (BLOCK_N pinned 64) loses to 2 single-acc
+GEMMs (BLOCK_N free to 128) + separate swiglu (bench_gateup_split_jun27.py). Fused
+(shipped BK256/nw8) = 147.4us beats ALL split variants (159-170us, 0.87-0.92x): the
+~18MB extra intermediate traffic of the split outweighs any tile-efficiency gain.
+EXP-E's fusion decision holds; gate_up is DONE at 147us (25us above the 122us HBM
+floor, irreducible for a Triton kernel).
+
+## SESSION VERDICT
+One solid win (swiglu BK=256, +2.3%). The b128 single-token decode is GEMM-bound and
+every GEMM is at its int8 limit: HBM-bound gate_up/lm_head (int4 faith-dead per EXP-I,
+kernel-overhead-dead per EXP-O) and L2-resident compute-bound qkv/down/o_proj (M=128
+tensor-core efficiency limited, tiles optimal). Structural levers the FIXED profiler
+can't reward: speculative decode (profiler hardcodes 1 token/model-call), paged/
+right-sized KV + higher batch (sweep caps at b128; long flavors never beat instruct's
+agg). KV-int8 / FP8-KV dead at short context (L2-resident). Remaining ideas are all
+<1-2% or faith/profiler-blocked: sampling-in-graph (~1%, graph-safe-RNG risk),
+down/o_proj quant fusion (blocked by per-row-amax-across-tiles), first-layer-qkv W8A8
+(~0.2%). Engine is near-optimal for this metric.

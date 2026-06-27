@@ -59,5 +59,20 @@ generic prefill attention kernel untouched).
   µs/call. seq_tps_b1 neutral (94.8, b1 uses W8A16 fallback). Mechanism deterministic
   (op self-time dropped exactly the standalone delta × 32). NEW BASELINE.
 
-- EXP-2 (in progress): int8 KV cache. Kernel + standalone gate written
-  (kernels/flash_decode_int8_kernel.py, bench_flash_int8_jun27.py).
+- **EXP-2 int8 KV cache — DISCARD for the headline (measured, not assumed).**
+  Built kernels/flash_decode_int8_kernel.py (int8 K/V + per-(b,head,pos) fp32 scale,
+  dequant folded into online softmax) and a standalone gate (bench_flash_int8_jun27.py).
+  Faithfulness EXCELLENT: rel_err ~0.017, cos 0.99998 (attention is a weighted avg → robust
+  to KV quant). BUT speed at the SHORT-context instruct headline LOSES:
+    kv_len  32:0.96x  64:0.88x  128:0.80x | 256:2.40x  512:1.62x  1024:1.40x
+  Mechanism: at b128 short context the K+V cache (~32MB at kv_len=64) FITS the 96MB L2, so
+  flash_decode is L2/compute-bound, NOT HBM-bound → halving bytes is a no-op and the extra
+  scale loads + dequant FMA make it slower. int8 KV only wins once kv_len≥256 (KV exceeds L2).
+  The instruct headline runs kv_len~32-93, so this can't move it; long-context flavors win
+  from it but never beat instruct's agg at b128 (longer KV = slower decode). The jun11
+  "KV-int8 dead for the headline" verdict was RIGHT (now measured; mechanism = L2-resident
+  short-context KV, the same L2 insight as for weights). NOT wired (simplicity). Kept the
+  kernel+bench as evidence. CONFIRMED-DEAD for the b128 headline.
+
+- EXP-3 (in progress): re-sweep qkv/down/o_proj _w8a8_gemm tiles (BLOCK_K/ns/nw) — the
+  same "wrong-tile / un-swept dim" lever that just won EXP-1 on swiglu.
