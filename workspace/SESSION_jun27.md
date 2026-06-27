@@ -43,4 +43,21 @@ generic prefill attention kernel untouched).
    epilogue (marginal); lm_head W4A8 (faith risk ~1.5%); revisit gate_up pipelining.
 
 ## Log
-- (pending baseline)
+- **Baseline (348e6ae, full sweep): best_agg_tps=9393.0, seq_tps_b1=94.7, vram=39.07.**
+  Op table (instruct b128, per decode step of 13.627ms): gate_up swiglu 5.36ms (39%),
+  qkv+down+o_proj _w8a8_gemm 4.99ms (37%), flash_decode 1.39ms (10%), norms/quant/rope/
+  KV-write ~1.1ms (8%), sampling ~0.35ms (3%). (_w8a16_gemm 365ms in the table is PREFILL,
+  not decode — 96 prefill GEMMs @ M=3712 + the 63 first-layer-qkv decode calls.)
+
+- **EXP-1 gate_up swiglu BLOCK_K=256/nw=8 — KEEP (70d1793, +2.3%).**
+  gate_up is the biggest decode op; its 117MB int8 weight > 96MB L2 → HBM-bound (122µs
+  floor) and sat at 167.5µs (~45µs un-hidden int8 MMA). Widened BLOCK_K 128→256 (half the
+  K-loop trips, wider weight loads) + num_warps 4→8 (spreads the two int32 accumulators,
+  eases the register pressure pinning BLOCK_N=64). Standalone sweep (tune_swiglu_jun27.py):
+  147.1µs vs 156.0µs = 1.06x, bit-identical (rel_err=0); ns≥3 fails (>128KB smem at BK=256).
+  Iso A/B: 9565.6→9819.7 (+2.66%); full sweep 9393.0→9609.7 (+2.30%); swiglu op 167.5→158.3
+  µs/call. seq_tps_b1 neutral (94.8, b1 uses W8A16 fallback). Mechanism deterministic
+  (op self-time dropped exactly the standalone delta × 32). NEW BASELINE.
+
+- EXP-2 (in progress): int8 KV cache. Kernel + standalone gate written
+  (kernels/flash_decode_int8_kernel.py, bench_flash_int8_jun27.py).

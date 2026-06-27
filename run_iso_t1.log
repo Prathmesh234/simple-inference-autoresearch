@@ -1,0 +1,54 @@
+Backend: triton (fused kernels)   Model: meta-llama/Llama-3.1-8B
+Locating model: meta-llama/Llama-3.1-8B
+Fetching 14 files:   0%|          | 0/14 [00:00<?, ?it/s]Fetching 14 files: 100%|██████████| 14/14 [00:00<00:00, 156170.89it/s]
+/home/ubuntu/simple-inference-autoresearch/.venv/lib/python3.10/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+USDT:2026-06-27 22:12:24 23577:23577 ActivityProfilerController.cpp:415] profiler_start
+USDT:2026-06-27 22:12:26 23577:23577 ActivityProfilerController.cpp:455] profiler_stop
+Model directory: /home/ubuntu/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b
+  Found 291 tensors across 4 shards
+
+==============================================================================
+  flavor=instruct   new_tokens=64
+  class: short prompt, decode-bound (isolates decode tok/s)
+------------------------------------------------------------------------------
+  batch  prompt_tok  prefill_ms  decode_ms  tok/s(agg)  tok/s/seq  VRAM_GB
+      1          10       30.54     10.474        95.5       95.5     9.87
+    128          29      370.63     13.035      9819.7       76.7    12.49
+------------------------------------------------------------------------------
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                            _w8a16_gemm         0.00%       0.000us         0.00%       0.000us       0.000us     321.378ms        28.10%     321.378ms       2.009ms           0 B           0 B           0 B           0 B           160  
+                                       _w8a8_swiglu_fwd         0.00%       0.000us         0.00%       0.000us       0.000us     312.345ms        27.31%     312.345ms     154.933us           0 B           0 B           0 B           0 B          2016  
+                                             _w8a8_gemm         0.00%       0.000us         0.00%       0.000us       0.000us     306.278ms        26.78%     306.278ms      50.641us           0 B           0 B           0 B           0 B          6048  
+                                      _flash_decode_fwd         0.00%       0.000us         0.00%       0.000us       0.000us      85.896ms         7.51%      85.896ms      42.607us           0 B           0 B           0 B           0 B          2016  
+                                           aten::linear         0.02%     234.211us         0.24%       2.722ms      85.066us       0.000us         0.00%      22.051ms     689.085us           0 B           0 B     928.00 MB           0 B            32  
+                                           aten::matmul         0.03%     326.750us         0.19%       2.195ms      68.597us       0.000us         0.00%      22.051ms     689.085us           0 B           0 B     928.00 MB           0 B            32  
+                                               aten::mm         0.12%       1.320ms         0.15%       1.684ms      52.616us      22.051ms         1.93%      22.051ms     689.085us           0 B           0 B     928.00 MB     928.00 MB            32  
+ampere_bf16_s1688gemm_bf16_64x128_sliced1x2_ldg8_f2f...         0.00%       0.000us         0.00%       0.000us       0.000us      22.051ms         1.93%      22.051ms     689.085us           0 B           0 B           0 B           0 B            32  
+                                 _add_rmsnorm_quant_fwd         0.00%       0.000us         0.00%       0.000us       0.000us      20.698ms         1.81%      20.698ms       5.133us           0 B           0 B           0 B           0 B          4032  
+                                       _quant_per_token         0.00%       0.000us         0.00%       0.000us       0.000us      12.152ms         1.06%      12.152ms       2.967us           0 B           0 B           0 B           0 B          4095  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      11.307ms         0.99%      11.307ms       2.718us           0 B           0 B           0 B           0 B          4160  
+                                            _swiglu_fwd         0.00%       0.000us         0.00%       0.000us       0.000us      11.135ms         0.97%      11.135ms     347.965us           0 B           0 B           0 B           0 B            32  
+                                           _rope_qk_fwd         0.00%       0.000us         0.00%       0.000us       0.000us      11.021ms         0.96%      11.021ms       5.381us           0 B           0 B           0 B           0 B          2048  
+                                             aten::topk         0.48%       5.465ms         1.03%      11.765ms     183.828us       9.837ms         0.86%       9.837ms     153.697us           0 B           0 B       3.91 MB       3.91 MB            64  
+void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       9.238ms         0.81%       9.238ms       2.291us           0 B           0 B           0 B           0 B          4032  
+void at::native::mbtopk::gatherTopK<c10::BFloat16, u...         0.00%       0.000us         0.00%       0.000us       0.000us       4.738ms         0.41%       4.738ms      74.038us           0 B           0 B           0 B           0 B            64  
+                                             _flash_fwd         0.00%       0.000us         0.00%       0.000us       0.000us       4.239ms         0.37%       4.239ms     132.469us           0 B           0 B           0 B           0 B            32  
+                                            aten::copy_         0.47%       5.363ms         1.00%      11.440ms      19.965us       3.418ms         0.30%       3.418ms       5.965us           0 B           0 B           0 B           0 B           573  
+void at::native::mbtopk::computeBlockDigitCounts<c10...         0.00%       0.000us         0.00%       0.000us       0.000us       3.383ms         0.30%       3.383ms      26.433us           0 B           0 B           0 B           0 B           128  
+                                              aten::div         0.18%       2.077ms         0.31%       3.589ms      28.040us       2.421ms         0.21%       2.421ms      18.912us           0 B           0 B       1.96 GB       1.96 GB           128  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 1.147s
+Self CUDA time total: 1.144s
+
+  trace -> /home/ubuntu/simple-inference-autoresearch/profiling/out/engine_instruct_b128_trace.json
+
+==============================================================================
+  SUMMARY (primary metric = best_agg_tps, higher is better)
+==============================================================================
+best_agg_tps:     9819.7
+best_agg_at:      flavor=instruct batch=128
+seq_tps_b1:       95.5
+peak_vram_gb:     12.49
