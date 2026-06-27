@@ -179,6 +179,7 @@ def _add_rmsnorm_quant_fwd(
     N, eps,
     BLOCK_SIZE: tl.constexpr,
     EMIT_BF16: tl.constexpr,
+    ADD_RESIDUAL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     h_row     = h_ptr + pid * stride_h
@@ -190,8 +191,15 @@ def _add_rmsnorm_quant_fwd(
     mask = cols < N
 
     h = tl.load(h_row + cols, mask=mask).to(tl.float32)
-    r = tl.load(r_row + cols, mask=mask).to(tl.float32)
-    new_r = (h + r).to(out_ptr.dtype.element_ty)
+    # ADD_RESIDUAL=False seeds the residual stream from the embedding (first block,
+    # which has no pending residual add) WITHOUT reading a residual buffer — it just
+    # normalises h and still emits the int8 quant so the first-layer qkv runs W8A8
+    # (was W8A16 because the old residual=None path emitted no int8).
+    if ADD_RESIDUAL:
+        r = tl.load(r_row + cols, mask=mask).to(tl.float32)
+        new_r = (h + r).to(out_ptr.dtype.element_ty)
+    else:
+        new_r = h.to(out_ptr.dtype.element_ty)
     tl.store(new_r_row + cols, new_r, mask=mask)
 
     xf = new_r.to(tl.float32)
@@ -222,6 +230,7 @@ def add_rmsnorm_quant_triton(
     weight: torch.Tensor,
     eps: float = 1e-5,
     emit_bf16: bool = True,
+    add_residual: bool = True,
 ):
     """add_rmsnorm that ALSO returns a per-token int8 quantization of the normed
     output for the W8A8 gate_up GEMM.
@@ -233,10 +242,16 @@ def add_rmsnorm_quant_triton(
         - normed_int8:  (n_rows, N) int8 ready for _w8a8_gemm
         - act_scale:    (n_rows,)  fp32 per-row scale
     """
-    assert hidden.shape == residual.shape
     orig_shape = hidden.shape
     h_2d = hidden.reshape(-1, hidden.shape[-1])
-    r_2d = residual.reshape(-1, residual.shape[-1])
+    # When add_residual is False (first block — residual seeded from the embedding),
+    # the kernel never reads r, so `residual` may be None; pass h as a dummy r_ptr.
+    if residual is None:
+        assert not add_residual, "residual is required when add_residual=True"
+        r_2d = h_2d
+    else:
+        assert hidden.shape == residual.shape
+        r_2d = residual.reshape(-1, residual.shape[-1])
     n_rows, N = h_2d.shape
     BLOCK_SIZE = triton.next_power_of_2(N)
 
@@ -256,5 +271,6 @@ def add_rmsnorm_quant_triton(
         N, eps,
         BLOCK_SIZE=BLOCK_SIZE,
         EMIT_BF16=emit_bf16,
+        ADD_RESIDUAL=add_residual,
     )
     return out.reshape(orig_shape), new_r.reshape(orig_shape), qi, qs

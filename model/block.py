@@ -154,15 +154,15 @@ class TransformerBlock(nn.Module):
         emit_bf16 = not (16 < M <= 256)
 
         # --- 1. Attention block ---
-        # First block: no pending add, just normalize and seed the residual (kept
-        # on the W8A16 qkv path — one of 32 layers, not worth a residual-less
-        # quant kernel). Later blocks: fold residual += x into the norm AND emit
-        # the per-token int8 quant of the normed output for free (EXP-D pattern),
-        # so the W8A8 qkv GEMM runs with no standalone activation-quant launch.
+        # First block seeds the residual from the embedding (no pending add); later
+        # blocks fold residual += x into the norm. Both go through add_norm_quant so
+        # they emit the per-token int8 quant of the normed output for free (EXP-D),
+        # letting EVERY layer's qkv run W8A8 (the first layer was W8A16 before — its
+        # old residual=None path emitted no int8). add_residual=False just skips the
+        # residual read for the first block.
         if residual is None:
-            residual = x
-            h = self.attn_norm(x)
-            h_int8, h_scale = None, None
+            h, residual, h_int8, h_scale = self.attn_norm.add_norm_quant(
+                x, None, emit_bf16=emit_bf16, add_residual=False)
         else:
             h, residual, h_int8, h_scale = self.attn_norm.add_norm_quant(
                 x, residual, emit_bf16=emit_bf16)
