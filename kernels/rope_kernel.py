@@ -214,8 +214,17 @@ def _apply_qk(
     # == stride(1) (holds when stride(0) == T*stride(1)). Fall back to a copy for
     # any exotic layout so correctness never depends on the fast-path assumptions.
     def _row_stride(x):
-        if (x.stride(-1) == 1 and x.stride(2) == head_dim
-                and x.stride(0) == T * x.stride(1)):
+        # Need head_dim unit-stride and heads head_dim-apart within a row.
+        if x.stride(-1) != 1 or x.stride(2) != head_dim:
+            return None
+        # Flattened (B*T) row r = b*T + t sits at b*stride(0) + t*stride(1).
+        # T==1: only B rows, r==b -> row stride is stride(0) (the singleton T-dim's
+        # stride(1) is the *natural* n_heads*head_dim, NOT the real batch stride
+        # when q/k is a last-dim slice of the wider qkv buffer). T>1: uniform iff
+        # stride(0)==T*stride(1), then the row stride is stride(1).
+        if T == 1:
+            return x.stride(0)
+        if x.stride(0) == T * x.stride(1):
             return x.stride(1)
         return None
 
