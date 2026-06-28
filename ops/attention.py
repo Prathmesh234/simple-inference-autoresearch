@@ -201,11 +201,27 @@ class GroupedQueryAttention(nn.Module):
 
         kc = kv_cache.k_cache[self.layer_idx, :B]  # (B, Hkv, S, D) view into pool
         vc = kv_cache.v_cache[self.layer_idx, :B]
-        kc.index_copy_(2, ctx.pos_index, k)
-        vc.index_copy_(2, ctx.pos_index, v)
-
-        from kernels.flash_decode_kernel import attention_flash_decode
-        out = attention_flash_decode(q, kc, vc, ctx.kv_len)  # (B, 1, Hq, D)
+        if kv_cache.is_int8:
+            # int8 KV (long-context flavors): quantize the new token's K/V per (b,head),
+            # scatter int8 + scale into the cache, and read it back with the int8 flash
+            # (halved bytes -> fits + faster at long kv_len). is_int8 is a constexpr-like
+            # Python bool fixed at graph-capture, so the bf16 headline path skips this.
+            from model.kv_cache import quantize_kv_int8
+            from kernels.flash_decode_int8_kernel import attention_flash_decode_int8
+            ki, ks = quantize_kv_int8(k)
+            vi, vs = quantize_kv_int8(v)
+            ksc = kv_cache.k_scale[self.layer_idx, :B]
+            vsc = kv_cache.v_scale[self.layer_idx, :B]
+            kc.index_copy_(2, ctx.pos_index, ki)
+            vc.index_copy_(2, ctx.pos_index, vi)
+            ksc.index_copy_(2, ctx.pos_index, ks)
+            vsc.index_copy_(2, ctx.pos_index, vs)
+            out = attention_flash_decode_int8(q, kc, vc, ksc, vsc, ctx.kv_len)
+        else:
+            kc.index_copy_(2, ctx.pos_index, k)
+            vc.index_copy_(2, ctx.pos_index, v)
+            from kernels.flash_decode_kernel import attention_flash_decode
+            out = attention_flash_decode(q, kc, vc, ctx.kv_len)  # (B, 1, Hq, D)
         out = out.reshape(B, T, self.num_heads_q * self.head_dim)
         M = B * T
         if 64 < M <= 256:

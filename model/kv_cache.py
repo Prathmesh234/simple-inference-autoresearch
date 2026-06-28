@@ -55,7 +55,24 @@ from __future__ import annotations
 import torch
 
 
+def quantize_kv_int8(x: torch.Tensor):
+    """Per-(…, head_dim) symmetric int8 quant of a K or V tensor.
+
+    x: (..., D) → returns (int8 same shape, fp16 scale with the D axis dropped).
+    scale = max|x| over D / 127 ; xi = round(x/scale). Used on the KV write path.
+    """
+    amax = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8).float()
+    scale = amax / 127.0
+    xi = torch.round(x.float() / scale).clamp_(-127, 127).to(torch.int8)
+    return xi, scale.squeeze(-1).to(torch.float16)
+
+
 class KVCache:
+    # Caches sized longer than this switch to int8 KV (long context -> HBM-bound flash
+    # where int8 halves bytes and wins; short context stays bf16, EXP-2). instruct's
+    # max_seq_len ~93 stays bf16; code/chat/long_ctx/summarize (>=455) go int8.
+    INT8_SEQ_THRESHOLD = 256
+
     def __init__(
         self,
         n_layers: int,
@@ -85,13 +102,31 @@ class KVCache:
         self.head_dim    = head_dim
         self.dtype       = dtype
         self.device      = torch.device(device)
-        ##this is the limitation paged attention addresses 
-        ## so right now we are blocking for the entire seq len, but in reality we never know what is going to be the user 
-        ## sequence request. For all you know we blocked 1024 tokens worth of KV Cache memory but the user 
-        ## sent a request with like 10 tokens wasting 1014 slots 
-        shape = (n_layers, max_batch, n_heads_kv, max_seq_len, head_dim)
-        self.k_cache = torch.zeros(shape, dtype=dtype, device=self.device)
-        self.v_cache = torch.zeros(shape, dtype=dtype, device=self.device)
+
+        # INT8 KV cache (fp8/int8-KV serving strategy) for LONG context. At short
+        # context (instruct headline, kv_len<256) the K/V already fits L2 so int8 is a
+        # no-op + dequant overhead loses (EXP-2) — keep bf16 there. But once the context
+        # exceeds L2 the flash read is HBM-bound: int8 HALVES the KV bytes, which (a)
+        # cuts KV VRAM ~2x → lets the long-prompt flavors reach higher batch without OOM,
+        # and (b) makes the decode flash 1.4-2.4x faster (measured kv_len 256..1024). We
+        # auto-pick int8 when this cache is sized for long sequences so the instruct
+        # headline stays on the fast bf16 path. Faithful: per-(b,head,pos) symmetric int8
+        # of K/V, attention is a weighted avg → cos 0.99998 vs bf16 (EXP-2).
+        self.is_int8 = max_seq_len > KVCache.INT8_SEQ_THRESHOLD
+        ##this limitation (pre-blocking the entire seq len) is what paged attention
+        ## addresses; the int8 path above halves the bytes we pre-block for long context.
+        if self.is_int8:
+            shape = (n_layers, max_batch, n_heads_kv, max_seq_len, head_dim)
+            self.k_cache = torch.zeros(shape, dtype=torch.int8, device=self.device)
+            self.v_cache = torch.zeros(shape, dtype=torch.int8, device=self.device)
+            sshape = (n_layers, max_batch, n_heads_kv, max_seq_len)
+            self.k_scale = torch.zeros(sshape, dtype=torch.float16, device=self.device)
+            self.v_scale = torch.zeros(sshape, dtype=torch.float16, device=self.device)
+        else:
+            shape = (n_layers, max_batch, n_heads_kv, max_seq_len, head_dim)
+            self.k_cache = torch.zeros(shape, dtype=dtype, device=self.device)
+            self.v_cache = torch.zeros(shape, dtype=dtype, device=self.device)
+            self.k_scale = self.v_scale = None
 
     # ── core API ─────────────────────────────────────────────────────────────
 
@@ -125,6 +160,19 @@ class KVCache:
         assert end <= self.max_seq_len, (
             f"sequence overflow: start_pos+T={end} > max_seq_len={self.max_seq_len}"
         )
+
+        if self.is_int8:
+            # Store int8 + scale for later (int8) decode reads, but RETURN the bf16 k/v
+            # so PREFILL's own attention runs in full precision (prefill always covers
+            # [0,end) here, so the returned bf16 prefix == what we just wrote). Only the
+            # decode-time reads of this prefix are int8 — the standard KV-quant behavior.
+            ki, ks = quantize_kv_int8(k)
+            vi, vs = quantize_kv_int8(v)
+            self.k_cache[layer_idx, :B, :, start_pos:end, :] = ki
+            self.v_cache[layer_idx, :B, :, start_pos:end, :] = vi
+            self.k_scale[layer_idx, :B, :, start_pos:end] = ks
+            self.v_scale[layer_idx, :B, :, start_pos:end] = vs
+            return k, v
 
         # Write new K/V into their slots
         self.k_cache[layer_idx, :B, :, start_pos:end, :] = k
