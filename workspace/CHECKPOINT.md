@@ -4,7 +4,26 @@ _Last updated: 2026-06-28. Branch: `autoresearch/jun27` (forked from main @ 348e
 which has all jun11 wins merged). NOTE: this box reads ~16% HIGHER than jun11's
 (baseline best_agg_tps=9393 vs jun11's 8009) — compare WITHIN this branch only._
 
-## jun27/28 session result: 9393.0 -> 9791.5 (+4.24%), 5 real wins
+## jun28 KV / long-context strategies (user-directed: paged/radix/fp8-KV)
+The decode HEADLINE (instruct b128, short ctx ~9780) is at its GEMM-bound optimum and is
+NOT KV/memory-bound, so no KV strategy moves it. KV strategies pay off on the LONG-CONTEXT
+frontier — and there the gains are large:
+| change | effect |
+|---|---|
+| EXP-16 last-position prefill logits | only the sampled position gets logits ([B*T,vocab]
+  -> [B,vocab], the 29GB OOM source); opens code b128, instruct TTFT -7%, headline flat |
+| EXP-17 int8 KV cache (max_seq_len>256) | halves KV bytes -> opens EVERY OOM b128 cell
+  (chat/chat_real/long_ctx/summarize), peak_vram 44->36GB, code b128 +10%, headline flat |
+| EXP-18 int8 flash BLOCK_N 16->32 (long-ctx tune) | long cells +3-9% (summarize +9.3%) |
+NET: the engine now runs the ENTIRE flavor x batch sweep (to b128) with NO OOM, at LOWER
+peak VRAM (36 vs 39 baseline), headline untouched. int8 KV is bf16 for instruct (headline),
+int8 for long flavors (where EXP-2 showed int8 flash WINS at kv_len>=256). PagedKVCache +
+paged flash built & validated (bit-identical) but NOT default — 0.93x at short ctx, and
+uniform-length profiler batches make sequential blocks == contiguous + overhead, so it's the
+substrate for ragged/shared-prefix serving the profiler doesn't exercise. Radix is low-value
+here (distinct prompts share ~only BOS).
+
+## jun27/28 decode-headline result: 9393.0 -> ~9780 (+4.24%), 5 real wins
 | # | change | Δ | mechanism |
 |---|---|---|---|
 | EXP-1 | gate_up swiglu BLOCK_K 128->256, nw 4->8 | +2.30% | wider K-tiles hide int8 MMA under the HBM weight stream (gate_up is HBM-bound) |
