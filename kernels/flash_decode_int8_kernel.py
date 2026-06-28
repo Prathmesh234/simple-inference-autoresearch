@@ -38,9 +38,14 @@ import triton
 import triton.language as tl
 
 
-_DECODE_BLOCK_N = 16
+# This kernel runs ONLY for the int8-KV long-context regime (kv_len > 256), so it is
+# tuned for LONG kv_len, not the short bf16 headline. A wider BLOCK_N=32 (half the
+# loop trips of BLOCK_N=16) wins across the long range: 1.41x at kv_len~455 (code),
+# 1.19x at ~1012 (chat/long_ctx/summarize). num_stages=1 (the serial single-query
+# reduction needs no deep pipeline at this size). See tune_int8_flash_long_jun28.py.
+_DECODE_BLOCK_N = 32
 _DECODE_NUM_WARPS = 1
-_DECODE_NUM_STAGES = 2
+_DECODE_NUM_STAGES = 1
 
 
 @triton.jit
