@@ -808,3 +808,11 @@ int8 KV (opens all OOM cells, -8GB peak VRAM, +10% long-ctx decode). PagedKVCach
 flash built & validated (bit-identical) but NOT default (0.93x short ctx; uniform-length
 profiler batches make sequential blocks == contiguous + overhead -> substrate for ragged/
 shared-prefix serving the profiler doesn't exercise).
+
+## EXP-18 — int8 flash BLOCK_N 16->32, ns->1 (long-context tune) — KEEP (long cells +3-9%)
+The int8 flash runs only for int8-KV (long ctx), so tuned for long kv_len (was copied from
+the short bf16 config). BLOCK_N=32/ns1. Full sweep vs EXP-17 (all b128, int8 cells):
+summarize 4421->4834 (+9.3%), long_ctx 4729->4987 (+5.5%), chat_real 5247->5511 (+5.0%),
+chat 4936->5131 (+3.9%), code 6687->6901 (+3.2%). Headline 9791.7->9773.2 (instruct=bf16,
+untouched -> noise). peak_vram 36.06 unchanged. Bit-identical (online softmax is BLOCK_N-
+independent). KEEP — speeds every long-context decode cell.
