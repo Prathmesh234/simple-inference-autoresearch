@@ -1,9 +1,20 @@
 # CHECKPOINT — read me first next session
 
-_Last updated: 2026-06-27. Branch: `autoresearch/jun27` (forked from main @ 348e6ae,
-which has all jun11 wins merged). HEAD: swiglu-BK256 win + dead-end docs. NOTE: this
-box reads ~16% HIGHER than jun11's (baseline best_agg_tps=9393 vs jun11's 8009) —
-compare WITHIN this branch only. jun27 baseline 9393.0 -> 9609.7 after EXP-1._
+_Last updated: 2026-06-28. Branch: `autoresearch/jun27` (forked from main @ 348e6ae,
+which has all jun11 wins merged). NOTE: this box reads ~16% HIGHER than jun11's
+(baseline best_agg_tps=9393 vs jun11's 8009) — compare WITHIN this branch only._
+
+## jun27/28 session result: 9393.0 -> 9791.5 (+4.24%), 5 real wins
+| # | change | Δ | mechanism |
+|---|---|---|---|
+| EXP-1 | gate_up swiglu BLOCK_K 128->256, nw 4->8 | +2.30% | wider K-tiles hide int8 MMA under the HBM weight stream (gate_up is HBM-bound) |
+| EXP-8 | strided-input RoPE (drop q/k .contiguous() copies) | +0.86% | qkv-GEMM output slices are non-contiguous; read them via stride, no copy |
+| EXP-11 | skip dead bf16 normed write in W8A8 bucket | +0.62% | the bf16 normed is unused when qkv/gate_up are W8A8; freed HBM write BW |
+| EXP-12 | W8A8 first-layer qkv (add_residual=False norm) | +0.40% | last W8A16 GEMM in decode -> W8A8; unified all norms onto add_norm_quant |
+| EXP-10 | temp-after-topk (sampling) | ~0 | neutral, kept as simplification (drops full-vocab divide) |
+Every projection in the b128 decode step is now int8 tensor-core (no W8A16 left).
+LESSON (EXP-11): decode is HBM-WRITE-bandwidth-sensitive — cutting ANY dead write
+helps via reduced GEMM L2/HBM contention, even if the cutting kernel's own time is flat.
 
 ## 30-second TLDR
 Autonomously maximizing **`best_agg_tps`** (aggregate decode tok/s at instruct
@@ -18,9 +29,8 @@ win clearly beats ~±5% noise else `git reset --hard`/discard. Log EVERY experim
 **Current best (HEAD, pushed):**
 | metric | value | note |
 |---|---|---|
-| best_agg_tps | **9609.7** (full sweep, instruct b128) | +2.30% vs 9393 baseline (EXP-1) |
-| best_agg_tps (iso b128) | **9819.7** | iso runs fresh, ~2% above full sweep |
-| seq_tps_b1 | **94.8** | neutral (b1 uses W8A16/bf16 fallback) |
+| best_agg_tps | **9791.5** (full sweep, instruct b128) | +4.24% vs 9393 baseline (EXP-1/8/11/12) |
+| seq_tps_b1 | **94.7** | neutral (b1 uses W8A16/bf16 fallback) |
 | peak_vram_gb | **39.07** | unchanged |
 
 ## THE governing insight (refined this session)
@@ -49,27 +59,32 @@ At b128 the single-token decode is **GEMM-bound** and split into two regimes by 
 - **EXP-6 split-K W8A8 o_proj/down — DEAD** (atomic reduction 0.08-0.31x).
 
 ## CONFIRMED DEAD (cumulative — do not retry without a NEW mechanism)
-int4 gate_up (faith) · int4 lm_head (top50 0.79, faith) · W4A8 grouped gate_up (kernel
-overhead) · **KV-int8/FP8 at headline (L2-resident short ctx, EXP-2 measured)** ·
-**split-K W8A8 (EXP-6, atomic-dominated)** · GQA-grouped flash decode · transposed
-layout · qkv/down/o_proj tile re-sweep (EXP-3 optimal) · gate_up split-vs-fused (EXP-5)
-· lm_head retune (EXP-H + EXP-4 washout) · down BLOCK_M=128 (in-graph slower) · higher
-batch (profiler caps b128) · **speculative decode / sampling-in-graph (profiler hardcodes
-1 token/model-call + calls sample() externally → INCOMPATIBLE with the fixed harness)** ·
-paged/right-sized KV (long flavors never beat instruct headline).
+int4/W4A8 gate_up (KERNEL: faithful at g=64 but group=64 FORCES BLOCK_K=64, which is
+GEMM-inefficient — same constraint that killed EXP-13; EXP-O got 0.90x) · int4 lm_head
+(top50 0.79, faith-risky for the sampler) · **grouped-K quant fusion (down/o_proj quant
+into swiglu/flash epilogue) — EXP-13 DEAD: per-group scales sidestep the per-row-amax
+blocker but group=64 forces BLOCK_K=64, GEMM 0.78x, traffic saving < BLOCK_K penalty** ·
+**KV-int8/FP8 at headline (L2-resident short ctx, EXP-2 measured)** · **split-K W8A8
+(EXP-6, atomic-dominated)** · GQA-grouped flash decode · transposed layout · qkv/down/
+o_proj tile re-sweep (EXP-3 optimal) · gate_up split-vs-fused (EXP-5 fused optimal) ·
+lm_head retune (EXP-H + EXP-4 washout) · down BLOCK_M=128 (in-graph slower) · flash tile
+re-sweep (EXP-7 optimal at headline kv_len) · in-graph pos-derivation (EXP-9 flat — tax
+is on sample allocs, not pos copies) · higher batch (profiler caps b128) · **spec decode /
+sampling-in-graph (profiler hardcodes 1 tok/model-call + calls sample() externally →
+INCOMPATIBLE)** · paged/right-sized KV (long flavors never beat instruct headline).
 
-## Next-session levers (ALL <~1.5% or blocked — engine is near-optimal for this metric)
-- down/o_proj activation-quant fusion into the producer epilogue: BLOCKED by per-row
-  amax across the BLOCK_N tiles (swiglu tiles over I=14336); and the quant is graph-hidden
-  (~3us launch-bound) so low value anyway (~1.4%).
-- first-layer qkv W8A8 (currently W8A16, residual=None): ~0.2%, sub-noise.
-- A production-grade Marlin/CUTLASS low-bit kernel for gate_up/lm_head (out of
-  Triton-scope; would need a real cp.async pipeline to beat the int8 path on int4).
-- TTFT/prefill W8A8 (secondary metric, not the headline).
-- HONEST STATE: the b128 single-token decode is at its practical Triton optimum. The
-  two GEMM groups (~75% of decode) are at their int8 limits; the rest (flash 10%,
-  overhead 8%, sampling 3%) are near their floors. Re-trace the op table fresh first,
-  but expect diminishing returns — the high-value axes are closed.
+## Next-session levers — HONEST STATE: engine is at its practical Triton/M=128 optimum
+The b128 single-token decode is GEMM-bound; every projection is now W8A8 int8 tensor-core.
+The two GEMM groups (~76%) are at their int8 limits (M=128 tensor-core efficiency); flash
+(10.6%) is L2-bound + tile-optimal; the rest (~10%) is near memory floors. UNIFYING WALL:
+group-size-forces-small-BLOCK_K kills every low-bit/grouped idea (int4, grouped quant).
+The ONLY ≥1% lever is a production Marlin/CUTLASS-grade int4 GEMM (cp.async pipeline,
+pre-shuffled weights, in-iter multi-group) that overcomes the BLOCK_K penalty — far beyond
+hand-Triton, EXP-O scoped it out. Remaining hand-Triton ideas are all <0.3% AND add
+complexity (KV k+v write fusion ~0.2% EXP9-noise; rope->cache-write fusion ~0.1%; final
+norm->int8 for lm_head ~0.02%) → not worth it per the simplicity criterion. Re-trace the
+op table fresh, but expect <1% total remaining without a new numerical format or a
+non-Triton kernel backend.
 
 ## Run env (MUST re-set every session — fresh box)
 ```
