@@ -176,11 +176,25 @@ class LlamaModel(nn.Module):
         for layer in self.layers:
             x, residual = layer(x, residual, start_pos=start_pos, kv_cache=kv_cache)
 
-        # 3. Final layer norm — folds the last block's pending residual add in.
-        x, _ = self.norm.add_norm(x, residual)         # (B, T, hidden_size)
+        # 3+4. Only the LAST position's logits are ever sampled (prefill samples the
+        #      first new token from position T-1; decode is T==1). Computing logits for
+        #      all T prefill positions wastes a [B*T, vocab] GEMM AND a [B*T, vocab]
+        #      tensor — at b128 x 948-token prompts that logits tensor alone is ~29 GB
+        #      and is what OOMs the long-context flavors. Slice to the last position
+        #      BEFORE the final norm + lm_head so both run on (B,1,H), not (B,T,H). This
+        #      is the standard serving-engine "only sample positions get logits" trick:
+        #      it shrinks prefill TTFT + peak VRAM and lets the long flavors reach b128.
+        #      Decode (T==1) is unaffected. Returned shape stays (B, <=T->1, vocab) so
+        #      callers' logits[:, -1, :] is unchanged.
+        if x.shape[1] > 1:
+            x = x[:, -1:, :].contiguous()
+            residual = residual[:, -1:, :].contiguous() if residual is not None else None
 
-        # 4. Project to vocabulary logits
-        logits = self.head(x)                          # (B, T, vocab_size)
+        # Final layer norm — folds the last block's pending residual add in.
+        x, _ = self.norm.add_norm(x, residual)         # (B, 1, hidden_size)
+
+        # Project to vocabulary logits
+        logits = self.head(x)                          # (B, 1, vocab_size)
 
         return logits
 
