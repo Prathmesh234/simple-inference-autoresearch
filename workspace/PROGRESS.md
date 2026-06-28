@@ -745,3 +745,29 @@ group (>=256) would need atomics across swiglu tiles (back to the original block
 swiglu BLOCK_N is pinned at 64 by register spill). Net: +6.7us/layer = ~0.5% SLOWER.
 DEAD — confirms EXP-K's "not worth it" with the precise reason (group size forces a
 GEMM-inefficient BLOCK_K). The quant-fusion avenue is closed.
+
+## EXP-14 — int4 gate_up, BOTH Triton and native torch — DEAD (measured)
+The only ≥1% lever left: int4 halves the gate_up weight read (29MB vs 58.7MB). Tested two
+paths at the gate shape (M=128,N=14336,K=4096):
+(1) HAND-TRITON W4A8 (group=64, packed nibbles, grouped rescale): correct (rel 0.001) but
+    best 71us vs int8 57us = 0.81x. FUNDAMENTAL reason: faithful int4 needs group=64
+    (per-channel int4 is argmax-0.83 dead, EXP-I), and a per-group scale FORCES K=64 dots
+    (you can't merge groups into a bigger dot without mixing scales) — K=64 is too small
+    for efficient int8 tensor cores. No BLOCK_K tuning fixes it (the dots stay K=64). This
+    is the same group->small-K wall as EXP-13.
+(2) NATIVE torch._weight_int4pack_mm (tinygemm/gpt-fast): 536-711us at M=128 = ~0.1x. The
+    tinygemm int4 kernel is tuned for M=1 GEMV decode on Ampere, not M=128 on Ada sm_89.
+VERDICT: int4 gate_up DEAD on this hardware/shape via every accessible kernel. The only
+theoretical path is a Marlin-grade CUDA kernel (pre-shuffled weights + cp.async pipeline +
+in-register dequant overlapping the MMA) tuned for M=128/Ada — a multi-day expert build,
+not a loop iteration, and uncertain even then.
+
+## ============ jun27/28 SESSION FINAL ============
+9393.0 -> 9791.5 = **+4.24%**, 5 real wins (EXP-1 swiglu BK256 +2.30%, EXP-8 strided-rope
++0.86%, EXP-11 dead-bf16-write +0.62%, EXP-12 first-layer-qkv +0.40%; EXP-10 temp-after-topk
+neutral-kept). 9 rigorous negatives (EXP-2 KV-int8, EXP-3 tiles, EXP-4 lm_head/rope, EXP-5
+split, EXP-6 split-K, EXP-7 flash, EXP-9 eager-derive, EXP-13 grouped-quant, EXP-14 int4).
+Every projection in b128 decode is W8A8 int8 tensor-core. The two GEMM groups (76%) are at
+their M=128 int8 limits; everything else is near memory floors. UNIFYING WALL discovered:
+"group-size forces small BLOCK_K/K-dots" kills every low-bit + grouped-fusion idea. CONVERGED
+for pure PyTorch+Triton+native-torch; further gains need a custom Marlin-grade CUDA backend.
