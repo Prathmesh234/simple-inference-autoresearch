@@ -788,3 +788,23 @@ more cells; int8-KV next brings it down). The remaining OOMs (chat/long_ctx/summ
 948-1004 tok) are now KV-cache-bound (~17GB KV) -> int8-KV is the lever.
 Also landed (unwired, validated): PagedKVCache + paged_flash_decode (bit-identical to
 contiguous but 0.93x at short ctx -> would regress the instruct headline, so NOT default).
+
+## EXP-17 — int8 KV cache for long context — KEEP (opens every OOM cell, -8GB VRAM)
+Auto-int8 KV when max_seq_len>256 (long flavors), bf16 for instruct (headline). Halves
+KV bytes -> (a) fits, (b) faster int8 flash at long kv_len. RESULT (full sweep):
+best_agg_tps 9790.5->9791.7 (headline FLAT, instruct=bf16); peak_vram 44.47->36.06 (-8.4GB);
+b128 OOM cells chat/chat_real/long_ctx/summarize -> NONE (all 6 flavors run at b128); code
+b128 6069->6687 (+10%, int8 flash faster at kv_len~455). The engine now handles the ENTIRE
+flavor x batch sweep (to b128) with NO OOM at LOWER peak VRAM, headline untouched. New b128
+cells: chat 4936, chat_real 5247, long_ctx 4729, summarize 4421 (all < instruct -> headline
+unchanged). Faithful (coherent long-ctx gen). The fp8/int8-KV serving strategy, scoped to
+where it wins. KEEP.
+
+## jun28 KV-strategy summary (user-directed: paged/radix/fp8-KV)
+Decode HEADLINE (instruct b128, short ctx) is at its optimum (~9791, +4.24% from GEMM work)
+and is NOT KV/memory-bound, so no KV strategy moves it. KV strategies pay off on the
+LONG-CONTEXT frontier: EXP-16 last-position prefill (opens code b128, TTFT -7%) + EXP-17
+int8 KV (opens all OOM cells, -8GB peak VRAM, +10% long-ctx decode). PagedKVCache + paged
+flash built & validated (bit-identical) but NOT default (0.93x short ctx; uniform-length
+profiler batches make sequential blocks == contiguous + overhead -> substrate for ragged/
+shared-prefix serving the profiler doesn't exercise).
