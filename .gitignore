@@ -19,3 +19,6 @@ metrics/
 # Autoresearch experiment log + run output (kept untracked per program.md)
 results.tsv
 run.log
+run_*.log
+probe_*.log
+*.tmp.log

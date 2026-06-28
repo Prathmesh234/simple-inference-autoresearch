@@ -1,15 +1,0 @@
-Locating model: meta-llama/Llama-3.1-8B
-Fetching 14 files:   0%|          | 0/14 [00:00<?, ?it/s]Fetching 14 files: 100%|██████████| 14/14 [00:00<00:00, 150179.68it/s]
-/home/ubuntu/simple-inference-autoresearch/.venv/lib/python3.10/site-packages/torch/profiler/profiler.py:272: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
-  _warn_once(
-USDT:2026-06-27 22:53:46 39979:39979 ActivityProfilerController.cpp:415] profiler_start
-USDT:2026-06-27 22:53:47 39979:39979 ActivityProfilerController.cpp:455] profiler_stop
-Model directory: /home/ubuntu/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b
-  Found 291 tensors across 4 shards
-
-  B=128 prompt=29 decode=64
-  CLEAN decode_ms (model+sample) : 12.622
-  CLEAN decode_ms (model only)   : 12.347  (sample=0.275)
-  PROFILED decode_ms (model+sample): 13.166
-  profiler tax: 0.543 ms (4.3%)
-  => agg clean=10141  profiled=9722 tok/s

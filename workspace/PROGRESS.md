@@ -771,3 +771,62 @@ Every projection in b128 decode is W8A8 int8 tensor-core. The two GEMM groups (7
 their M=128 int8 limits; everything else is near memory floors. UNIFYING WALL discovered:
 "group-size forces small BLOCK_K/K-dots" kills every low-bit + grouped-fusion idea. CONVERGED
 for pure PyTorch+Triton+native-torch; further gains need a custom Marlin-grade CUDA backend.
+
+## ============ jun28 cont — KV/long-context strategies (user-directed) ============
+Re-pointed the loop at production KV techniques (paged/radix/fp8-KV). Diagnostic
+(diag_prefill_mem.py) overturned the assumption: the long-flavor OOMs are NOT KV-bound —
+they're the lm_head computing logits for ALL B*T prefill positions ([121344,128256] bf16
+= 28.99 GiB at b128, the exact failing alloc), yet only the LAST position is sampled.
+
+## EXP-16 — last-position prefill logits — KEEP (capability + TTFT; headline neutral)
+Slice x/residual to [:, -1:, :] before the final norm + lm_head (both run on (B,1,H) not
+(B,T,H)). Standard serving-engine "only sampled positions get logits". Bit-identical
+last-position logits -> greedy unchanged/coherent. RESULT: best_agg_tps 9790.5 (== headline,
+decode untouched); opens code b128 (was OOM -> 6069 agg) + long b64 cells; instruct TTFT
+418->388ms (-7%); b128x948 raw prefill OOM->42.7GB. peak_vram 39.07->44.47 (engine runs
+more cells; int8-KV next brings it down). The remaining OOMs (chat/long_ctx/summarize b128,
+948-1004 tok) are now KV-cache-bound (~17GB KV) -> int8-KV is the lever.
+Also landed (unwired, validated): PagedKVCache + paged_flash_decode (bit-identical to
+contiguous but 0.93x at short ctx -> would regress the instruct headline, so NOT default).
+
+## EXP-17 — int8 KV cache for long context — KEEP (opens every OOM cell, -8GB VRAM)
+Auto-int8 KV when max_seq_len>256 (long flavors), bf16 for instruct (headline). Halves
+KV bytes -> (a) fits, (b) faster int8 flash at long kv_len. RESULT (full sweep):
+best_agg_tps 9790.5->9791.7 (headline FLAT, instruct=bf16); peak_vram 44.47->36.06 (-8.4GB);
+b128 OOM cells chat/chat_real/long_ctx/summarize -> NONE (all 6 flavors run at b128); code
+b128 6069->6687 (+10%, int8 flash faster at kv_len~455). The engine now handles the ENTIRE
+flavor x batch sweep (to b128) with NO OOM at LOWER peak VRAM, headline untouched. New b128
+cells: chat 4936, chat_real 5247, long_ctx 4729, summarize 4421 (all < instruct -> headline
+unchanged). Faithful (coherent long-ctx gen). The fp8/int8-KV serving strategy, scoped to
+where it wins. KEEP.
+
+## jun28 KV-strategy summary (user-directed: paged/radix/fp8-KV)
+Decode HEADLINE (instruct b128, short ctx) is at its optimum (~9791, +4.24% from GEMM work)
+and is NOT KV/memory-bound, so no KV strategy moves it. KV strategies pay off on the
+LONG-CONTEXT frontier: EXP-16 last-position prefill (opens code b128, TTFT -7%) + EXP-17
+int8 KV (opens all OOM cells, -8GB peak VRAM, +10% long-ctx decode). PagedKVCache + paged
+flash built & validated (bit-identical) but NOT default (0.93x short ctx; uniform-length
+profiler batches make sequential blocks == contiguous + overhead -> substrate for ragged/
+shared-prefix serving the profiler doesn't exercise).
+
+## EXP-18 — int8 flash BLOCK_N 16->32, ns->1 (long-context tune) — KEEP (long cells +3-9%)
+The int8 flash runs only for int8-KV (long ctx), so tuned for long kv_len (was copied from
+the short bf16 config). BLOCK_N=32/ns1. Full sweep vs EXP-17 (all b128, int8 cells):
+summarize 4421->4834 (+9.3%), long_ctx 4729->4987 (+5.5%), chat_real 5247->5511 (+5.0%),
+chat 4936->5131 (+3.9%), code 6687->6901 (+3.2%). Headline 9791.7->9773.2 (instruct=bf16,
+untouched -> noise). peak_vram 36.06 unchanged. Bit-identical (online softmax is BLOCK_N-
+independent). KEEP — speeds every long-context decode cell.
+
+## EXP-19 — int4 KV cache — DEAD (faithfulness)
+Long cells are flash/KV-read-dominated; int4 KV would halve the read again. But int4 KV
+(per-(b,head,pos) symmetric, 16 levels) is too lossy: rel_err ~0.25, cos ~0.993 PER LAYER
+(vs int8 0.015 / 0.99998) — 4x the accepted bar, would compound over 32 layers. int8 KV is
+the sweet spot. int4 KV DEAD.
+
+## EXP-20 (building) — GQA-grouped int8 flash for long context
+The decode flash reads each kv-head's K/V 4x (once per the 4 sibling q-heads). At SHORT ctx
+(instruct) the KV fits L2 so the redundant reads are free (jun3 measured GQA-grouping 1.00x).
+But the LONG int8-KV cells read ~8.4GB/step with KV >> 96MB L2 → the 4x redundancy is 4x of
+HBM bandwidth. A GQA-grouped flash (1 program per (b,kv-head), reads K/V ONCE, computes all
+4 q-heads) cuts the KV read ~4x → est +40% on the long cells. jun3 only tested short ctx, so
+this is unexplored for the long regime. Building a grouped int8 flash kernel.
