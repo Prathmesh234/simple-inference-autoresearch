@@ -771,3 +771,20 @@ Every projection in b128 decode is W8A8 int8 tensor-core. The two GEMM groups (7
 their M=128 int8 limits; everything else is near memory floors. UNIFYING WALL discovered:
 "group-size forces small BLOCK_K/K-dots" kills every low-bit + grouped-fusion idea. CONVERGED
 for pure PyTorch+Triton+native-torch; further gains need a custom Marlin-grade CUDA backend.
+
+## ============ jun28 cont — KV/long-context strategies (user-directed) ============
+Re-pointed the loop at production KV techniques (paged/radix/fp8-KV). Diagnostic
+(diag_prefill_mem.py) overturned the assumption: the long-flavor OOMs are NOT KV-bound —
+they're the lm_head computing logits for ALL B*T prefill positions ([121344,128256] bf16
+= 28.99 GiB at b128, the exact failing alloc), yet only the LAST position is sampled.
+
+## EXP-16 — last-position prefill logits — KEEP (capability + TTFT; headline neutral)
+Slice x/residual to [:, -1:, :] before the final norm + lm_head (both run on (B,1,H) not
+(B,T,H)). Standard serving-engine "only sampled positions get logits". Bit-identical
+last-position logits -> greedy unchanged/coherent. RESULT: best_agg_tps 9790.5 (== headline,
+decode untouched); opens code b128 (was OOM -> 6069 agg) + long b64 cells; instruct TTFT
+418->388ms (-7%); b128x948 raw prefill OOM->42.7GB. peak_vram 39.07->44.47 (engine runs
+more cells; int8-KV next brings it down). The remaining OOMs (chat/long_ctx/summarize b128,
+948-1004 tok) are now KV-cache-bound (~17GB KV) -> int8-KV is the lever.
+Also landed (unwired, validated): PagedKVCache + paged_flash_decode (bit-identical to
+contiguous but 0.93x at short ctx -> would regress the instruct headline, so NOT default).
