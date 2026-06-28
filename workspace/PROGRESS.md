@@ -731,3 +731,17 @@ RESULT: 9752.4 -> 9791.5 (+0.40%); decode_ms 13.125->13.073; seq_tps_b1 94.7 neu
 KEEP. Cumulative jun27: 9393 -> 9791.5 (+4.24%). Real wins: EXP-1 swiglu BK256 (+2.3%),
 EXP-8 strided-rope (+0.86%), EXP-11 dead-bf16-write (+0.62%), EXP-12 first-layer-qkv (+0.40%).
 NO W8A16 GEMM remains in the b128 decode step — every projection is int8 tensor-core.
+
+## EXP-13 — fuse down quant into swiglu via grouped-K int8 — DEAD (BLOCK_K constraint)
+Re-examined the "down/o_proj quant fusion blocked by per-row amax" verdict: per-GROUP
+scales (group = swiglu BLOCK_N=64 tile) sidestep the per-row-amax blocker (each swiglu
+program has its 64-col tile in registers -> can emit that group's int8+scale), and
+grouped-K int8 rescale is cheap (no int4 unpack, unlike dead EXP-O). Would save the
+swiglu bf16 write + the standalone down quant (~234MB/step). MEASURED the grouped-K int8
+GEMM at the down shape (group=64): best 66.8us vs 49.5us per-row = 0.78x (SLOWER).
+MECHANISM: group=64 forces BLOCK_K=64, but down's K=14336 needs BLOCK_K=256 for an
+efficient GEMM (224 small K-iterations + per-iter rescale >> the saved traffic). A coarser
+group (>=256) would need atomics across swiglu tiles (back to the original blocker, since
+swiglu BLOCK_N is pinned at 64 by register spill). Net: +6.7us/layer = ~0.5% SLOWER.
+DEAD — confirms EXP-K's "not worth it" with the precise reason (group size forces a
+GEMM-inefficient BLOCK_K). The quant-fusion avenue is closed.
