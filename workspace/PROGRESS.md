@@ -816,3 +816,17 @@ summarize 4421->4834 (+9.3%), long_ctx 4729->4987 (+5.5%), chat_real 5247->5511 
 chat 4936->5131 (+3.9%), code 6687->6901 (+3.2%). Headline 9791.7->9773.2 (instruct=bf16,
 untouched -> noise). peak_vram 36.06 unchanged. Bit-identical (online softmax is BLOCK_N-
 independent). KEEP — speeds every long-context decode cell.
+
+## EXP-19 — int4 KV cache — DEAD (faithfulness)
+Long cells are flash/KV-read-dominated; int4 KV would halve the read again. But int4 KV
+(per-(b,head,pos) symmetric, 16 levels) is too lossy: rel_err ~0.25, cos ~0.993 PER LAYER
+(vs int8 0.015 / 0.99998) — 4x the accepted bar, would compound over 32 layers. int8 KV is
+the sweet spot. int4 KV DEAD.
+
+## EXP-20 (building) — GQA-grouped int8 flash for long context
+The decode flash reads each kv-head's K/V 4x (once per the 4 sibling q-heads). At SHORT ctx
+(instruct) the KV fits L2 so the redundant reads are free (jun3 measured GQA-grouping 1.00x).
+But the LONG int8-KV cells read ~8.4GB/step with KV >> 96MB L2 → the 4x redundancy is 4x of
+HBM bandwidth. A GQA-grouped flash (1 program per (b,kv-head), reads K/V ONCE, computes all
+4 q-heads) cuts the KV read ~4x → est +40% on the long cells. jun3 only tested short ctx, so
+this is unexplored for the long regime. Building a grouped int8 flash kernel.
