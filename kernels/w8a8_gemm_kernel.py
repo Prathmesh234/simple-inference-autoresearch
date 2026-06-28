@@ -237,8 +237,16 @@ def w8a8_swiglu_prequant(
     two_I = w_gate_up_int8.shape[0]
     I = two_I // 2
     y = torch.empty((M, I), dtype=torch.bfloat16, device=x_int8.device)
-    BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 128
-    num_stages, num_warps = 2, 4
+    # BLOCK_K=256 (vs 128) halves the K-loop trip count and issues wider int8
+    # weight loads, which better hides the int8 MMA under gate_up's HBM weight
+    # stream (117 MB int8 > 96 MB L2 -> HBM-bound, ~122us floor). num_warps=8
+    # spreads the two int32 accumulators over more threads, easing the register
+    # pressure that pins BLOCK_N at 64. Standalone at the decode shape (M=128,
+    # K=4096, I=14336): 147.1us vs 156.0us for the old (256/8 vs 128/4) tile =
+    # 1.06x, bit-identical output (rel_err=0). num_stages stays 2 (ns>=3 needs
+    # >128 KB smem at BLOCK_K=256 -> out of resource). See tune_swiglu_jun27.py.
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 256
+    num_stages, num_warps = 2, 8
     GROUP_M = 8
     grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(I, BLOCK_N),)
     _w8a8_swiglu_fwd[grid](

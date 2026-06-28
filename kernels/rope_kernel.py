@@ -84,12 +84,14 @@ import triton.language as tl
 )
 @triton.jit
 def _rope_qk_fwd(
-    q_ptr,        # input  Q (n_tokens, n_heads_q,  head_dim) contiguous
-    k_ptr,        # input  K (n_tokens, n_heads_kv, head_dim) contiguous
+    q_ptr,        # input  Q (n_tokens, n_heads_q,  head_dim), rows q_in_rs apart
+    k_ptr,        # input  K (n_tokens, n_heads_kv, head_dim), rows k_in_rs apart
     cos_ptr,      # cos    (seq_len, cos_row_stride) — only first HALF used
     sin_ptr,      # sin    same layout as cos
     q_out_ptr,    # output Q (n_tokens, n_heads_q,  head_dim) contiguous
     k_out_ptr,    # output K (n_tokens, n_heads_kv, head_dim) contiguous
+    q_in_rs,      # input row stride for Q (== n_heads_q*head_dim if contiguous)
+    k_in_rs,      # input row stride for K (== n_heads_kv*head_dim if contiguous)
     n_heads_q: tl.constexpr,
     n_heads_kv: tl.constexpr,
     seq_len,
@@ -107,8 +109,14 @@ def _rope_qk_fwd(
     rotate K heads. This fuses what used to be two separate kernel launches
     (one for Q, one for K) into one — halving RoPE launches per decode step.
 
-    The rotation math is identical to the per-tensor kernel (float32 compute,
-    store back in the input dtype), so output is bit-identical.
+    Input is read with an explicit per-row stride (q_in_rs / k_in_rs) so the
+    Q/K slices of the fused-qkv GEMM output — which are NON-contiguous (their row
+    stride is the full qkv width, e.g. 6144, not n_heads*head_dim) — can be rotated
+    in place WITHOUT a prior `.contiguous()` copy (2 copy kernels/layer eliminated
+    from every decode step). Within a row the heads are head_dim-contiguous and the
+    head_dim itself is unit-stride for both the contiguous and the sliced layouts,
+    so only the row base differs between input and (contiguous) output. The rotation
+    math is identical (float32 compute, store in the input dtype) → bit-identical.
     """
     row_pid = tl.program_id(0)       # one row = one token (B*T flattened)
     col_pid = tl.program_id(1)       # head index across Q heads then K heads
@@ -126,35 +134,34 @@ def _rope_qk_fwd(
 
     out_dtype = q_ptr.dtype.element_ty  # q and k share dtype; hoist out of branches
 
+    # Within-head offsets of the rotation pair — identical for the (possibly
+    # strided) input base and the contiguous output base.
+    if INTERLEAVED:
+        da = 2 * cols
+        db = da + 1
+    else:
+        da = cols
+        db = da + HALF
+
     if col_pid < n_heads_q:
-        head_base = (row_pid * n_heads_q + col_pid) * HEAD_DIM
-        if INTERLEAVED:
-            offs_a = head_base + 2 * cols
-            offs_b = offs_a + 1
-        else:
-            offs_a = head_base + cols
-            offs_b = offs_a + HALF
-        x_a = tl.load(q_ptr + offs_a, mask=mask, other=0.0).to(tl.float32)
-        x_b = tl.load(q_ptr + offs_b, mask=mask, other=0.0).to(tl.float32)
+        in_base = row_pid * q_in_rs + col_pid * HEAD_DIM
+        out_base = (row_pid * n_heads_q + col_pid) * HEAD_DIM
+        x_a = tl.load(q_ptr + in_base + da, mask=mask, other=0.0).to(tl.float32)
+        x_b = tl.load(q_ptr + in_base + db, mask=mask, other=0.0).to(tl.float32)
         out_a = x_a * cos - x_b * sin
         out_b = x_b * cos + x_a * sin
-        tl.store(q_out_ptr + offs_a, out_a.to(out_dtype), mask=mask)
-        tl.store(q_out_ptr + offs_b, out_b.to(out_dtype), mask=mask)
+        tl.store(q_out_ptr + out_base + da, out_a.to(out_dtype), mask=mask)
+        tl.store(q_out_ptr + out_base + db, out_b.to(out_dtype), mask=mask)
     else:
         head = col_pid - n_heads_q
-        head_base = (row_pid * n_heads_kv + head) * HEAD_DIM
-        if INTERLEAVED:
-            offs_a = head_base + 2 * cols
-            offs_b = offs_a + 1
-        else:
-            offs_a = head_base + cols
-            offs_b = offs_a + HALF
-        x_a = tl.load(k_ptr + offs_a, mask=mask, other=0.0).to(tl.float32)
-        x_b = tl.load(k_ptr + offs_b, mask=mask, other=0.0).to(tl.float32)
+        in_base = row_pid * k_in_rs + head * HEAD_DIM
+        out_base = (row_pid * n_heads_kv + head) * HEAD_DIM
+        x_a = tl.load(k_ptr + in_base + da, mask=mask, other=0.0).to(tl.float32)
+        x_b = tl.load(k_ptr + in_base + db, mask=mask, other=0.0).to(tl.float32)
         out_a = x_a * cos - x_b * sin
         out_b = x_b * cos + x_a * sin
-        tl.store(k_out_ptr + offs_a, out_a.to(out_dtype), mask=mask)
-        tl.store(k_out_ptr + offs_b, out_b.to(out_dtype), mask=mask)
+        tl.store(k_out_ptr + out_base + da, out_a.to(out_dtype), mask=mask)
+        tl.store(k_out_ptr + out_base + db, out_b.to(out_dtype), mask=mask)
 
 
 def _check_cos_sin(cos: torch.Tensor, sin: torch.Tensor, head_dim: int) -> int:
@@ -199,10 +206,36 @@ def _apply_qk(
     seq_len = cos.shape[0]
     assert sin.shape[0] == seq_len
 
-    q = q.contiguous()
-    k = k.contiguous()
-    q_out = torch.empty_like(q)
-    k_out = torch.empty_like(k)
+    # The kernel reads Q/K with an explicit per-(B*T)-row stride, so the
+    # NON-contiguous Q/K slices of the fused-qkv GEMM output are rotated in place
+    # without a `.contiguous()` copy. The required layout is: head_dim unit-stride
+    # and heads head_dim-apart within a row (true for both a contiguous tensor and
+    # a last-dim slice of the wider qkv buffer), and a uniform flattened-row stride
+    # == stride(1) (holds when stride(0) == T*stride(1)). Fall back to a copy for
+    # any exotic layout so correctness never depends on the fast-path assumptions.
+    def _row_stride(x):
+        # Need head_dim unit-stride and heads head_dim-apart within a row.
+        if x.stride(-1) != 1 or x.stride(2) != head_dim:
+            return None
+        # Flattened (B*T) row r = b*T + t sits at b*stride(0) + t*stride(1).
+        # T==1: only B rows, r==b -> row stride is stride(0) (the singleton T-dim's
+        # stride(1) is the *natural* n_heads*head_dim, NOT the real batch stride
+        # when q/k is a last-dim slice of the wider qkv buffer). T>1: uniform iff
+        # stride(0)==T*stride(1), then the row stride is stride(1).
+        if T == 1:
+            return x.stride(0)
+        if x.stride(0) == T * x.stride(1):
+            return x.stride(1)
+        return None
+
+    q_rs, k_rs = _row_stride(q), _row_stride(k)
+    if q_rs is None:
+        q = q.contiguous(); q_rs = n_heads_q * head_dim
+    if k_rs is None:
+        k = k.contiguous(); k_rs = n_heads_kv * head_dim
+
+    q_out = torch.empty(B, T, n_heads_q, head_dim, dtype=q.dtype, device=q.device)
+    k_out = torch.empty(B, T, n_heads_kv, head_dim, dtype=k.dtype, device=k.device)
 
     n_tokens   = B * T
     HALF       = head_dim // 2
@@ -212,6 +245,7 @@ def _apply_qk(
     grid = (n_tokens, n_heads_q + n_heads_kv)
     _rope_qk_fwd[grid](
         q, k, cos, sin, q_out, k_out,
+        q_rs, k_rs,
         n_heads_q,
         n_heads_kv,
         seq_len,
