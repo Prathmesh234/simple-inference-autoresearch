@@ -717,3 +717,17 @@ latency-bound: 128 rows x 4096 reduction, the write was overlapped) — the win 
 HBM WRITE bandwidth reducing contention on the L2/HBM-bound GEMMs. KEEP. Cumulative jun27:
 9393 -> 9752 (+3.8%). Real wins: EXP-1 swiglu BK256 (+2.3%), EXP-8 strided-rope (+0.86%),
 EXP-11 dead-bf16-write (+0.62%).
+
+## EXP-12 — W8A8 first-layer qkv via add_residual=False norm — KEEP (+0.40%)
+The first block seeded the residual with residual=None -> plain attn_norm(x), emitting
+NO int8, so its qkv fell back to W8A16 (~2x slower than W8A8 at M=128, the only W8A16
+GEMM left in decode). Added an ADD_RESIDUAL constexpr to add_rmsnorm_quant: =False
+normalises the embedding without reading a residual buffer but STILL emits int8+scale,
+so layer 0's qkv runs W8A8 like layers 1-31. Unifies all norms onto add_norm_quant.
+Deterministic: _w8a16_gemm 160->97 calls (the 63 first-layer-qkv decode calls vanish,
+now prefill-only), _w8a8_gemm 6048->6111. Faithful (== accepted layer-1..31 W8A8 quant);
+coherent at B=35 (now says "Paris"; 2+2=4; water boils 100C). b1 keeps W8A16 qkv (M<=16).
+RESULT: 9752.4 -> 9791.5 (+0.40%); decode_ms 13.125->13.073; seq_tps_b1 94.7 neutral.
+KEEP. Cumulative jun27: 9393 -> 9791.5 (+4.24%). Real wins: EXP-1 swiglu BK256 (+2.3%),
+EXP-8 strided-rope (+0.86%), EXP-11 dead-bf16-write (+0.62%), EXP-12 first-layer-qkv (+0.40%).
+NO W8A16 GEMM remains in the b128 decode step — every projection is int8 tensor-core.
