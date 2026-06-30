@@ -78,3 +78,46 @@ no long-context cell can beat it (code b128 7090 would need +41%). So headline g
 require speeding instruct b128, which is walled without a Marlin-grade int4 GEMM.
 Remaining real progress is on the FRONTIER (long-context decode, VRAM, b1 latency):
 next is EXP-20 (GQA-grouped int8 flash) for the long cells.
+
+## EXP-20 — GQA-grouped int8 flash (the jun28 WIP) — DEAD for the profiler's range
+Validated the unwired kernel. Faithful (cos 0.99998) but speed: 1.00x at kv 455/768,
+1.06-1.08x at kv 1012, crossing to 1.22x@2048 / 1.32x@4096. The profiler's longest
+flavor caps at kv ~1068 (summarize/long_ctx b128), where it's only ~1.08x. MECHANISM:
+Ada's 96MB L2 absorbs the redundant sibling KV reads — the CONCURRENT working set
+(programs resident × per-program KV) fits L2 up to ~kv 1500, so the "4x redundancy"
+isn't 4x of HBM until kv>=2048 (which the profiler never reaches). Extends jun3's
+short-ctx 1.00x finding. NOT wired (would help only true >=2k-token serving). The
+jun28 premise (~4x read reduction -> big win) was wrong: it's L2-bound, not HBM-bound,
+in the profiler's kv range.
+
+## int4 KV (grouped) — DEAD (faithfulness), extends EXP-19
+EXP-19 killed per-vector int4 KV (rel 0.25). Probed grouped int4 KV (finer scales):
+g=32 rel 0.18-0.21, g=16 rel 0.16-0.19, g=8 rel 0.13-0.15 — all >>10x the int8 bar
+(0.014), while real byte savings SHRINK with finer grouping (g=8 only 1.35x vs int8;
+per-vector 1.97x). int4 KV cannot be both faithful and meaningfully smaller than int8.
+DEAD at all group sizes.
+
+## EXP-22 — weight-only int8 o_proj for b1-b64 — KEEP (+5.9% seq_tps_b1, the big frontier win)
+The b1 op table showed _w8a16_gemm = 82.5% of b1 decode, all GEMMs int8 EXCEPT o_proj,
+which used bf16 cuBLAS for M<=64 (the dispatch capped W8A8 o_proj at 64<M<=256 and fell
+back to F.linear bf16 below). o_proj was the LAST bf16 weight in low-batch decode.
+INSIGHT (a "wrong dead verdict", like EXP-M/N): "b1 keeps bf16 cuBLAS" missed that
+cuBLAS GEMV at M=1 is inefficient AND in the full decode each layer's o_proj weight is
+evicted from L2 between layers -> HBM-bound, so bf16 reads 33MB/layer. Dispatch M<=64
+decode o_proj to the weight-only int8 W8A16 path (reuses the existing w_o_int8 buffer):
+halves the read (16.7MB), no act quant (loses at M<=64, EXP-N), bit-faithful (W8A16 is
+the accepted weight-only int8). ONE-LINE change in ops/attention._decode_graph_forward.
+RESULT (full sweep): seq_tps_b1 94.7->100.3 (+5.9%); instruct b1 91.3->96.2, b32 +6.3%,
+b64 +5.1%; chat b1 94.7->100.3, chat_real 75.9->80.6 — EVERY flavor's b1-b64 cells lift
+~5-6%. best_agg_tps 9997.7->9958.4 (FLAT, b128 o_proj is W8A8 unchanged; noise). VRAM
+flat (35.82). Focused (cooler) run showed b1 +11.3%; full-sweep (instruct 5th, warmer)
++5.9% — the true gain is in that range. Lifts the entire interactivity/low-batch
+frontier. KEEP. The surprise: cuBLAS GEMV at M=1 was much worse than its byte count
+(+11% vs the ~3% bytes would predict), so this was a kernel-inefficiency win, not just
+a bandwidth one.
+
+## jun30 session wins: EXP-21 (fused sampler, +0.73% headline) + EXP-22 (int8 o_proj
+## b1-b64, +5.9% seq_tps_b1). best_agg_tps converged (~10000, int8 GEMM wall, int4
+## GEMM+KV dead). Frontier pushed on the interactivity axis. Next: probe AWQ int4
+## gate_up at b1 (bandwidth-bound GEMV where the K=64 kernel wall is hidden) — the last
+## untried tracked-metric lever; faithfulness (AWQ vs EXP-O's naive top5 0.6-0.7) is the gate.
