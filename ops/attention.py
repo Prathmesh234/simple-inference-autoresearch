@@ -227,7 +227,16 @@ class GroupedQueryAttention(nn.Module):
         if 64 < M <= 256:
             from kernels.w8a8_gemm_kernel import w8a8_oproj_linear
             return w8a8_oproj_linear(out, self.w_o_int8, self.w_o_scale)
-        return F.linear(out, self.wo)
+        # b1-b64 decode (M<=64): weight-only int8 o_proj. This was the LAST bf16
+        # weight in the low-batch decode step — bf16 cuBLAS reads 33MB/layer, but
+        # in the full decode each layer's o_proj weight is evicted from L2 between
+        # layers, so it is HBM-bound; int8 halves that read (16.7MB). No per-token
+        # act quant here (it loses at M<=64, EXP-N), so weight-only W8A16 — the same
+        # bit-faithful int8 path used for qkv/down at this M. b1-b64 are bandwidth-
+        # bound, so fewer weight bytes is a direct single-stream/low-batch win.
+        # (Prefill, M>256, stays on bf16 cuBLAS via the eager forward path.)
+        from kernels.w8a16_gemm_kernel import w8a16_linear_triton
+        return w8a16_linear_triton(out, self.w_o_int8, self.w_o_scale)
 
     def forward(
         self,
