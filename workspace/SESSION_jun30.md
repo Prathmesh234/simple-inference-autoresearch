@@ -116,8 +116,45 @@ frontier. KEEP. The surprise: cuBLAS GEMV at M=1 was much worse than its byte co
 (+11% vs the ~3% bytes would predict), so this was a kernel-inefficiency win, not just
 a bandwidth one.
 
-## jun30 session wins: EXP-21 (fused sampler, +0.73% headline) + EXP-22 (int8 o_proj
-## b1-b64, +5.9% seq_tps_b1). best_agg_tps converged (~10000, int8 GEMM wall, int4
-## GEMM+KV dead). Frontier pushed on the interactivity axis. Next: probe AWQ int4
-## gate_up at b1 (bandwidth-bound GEMV where the K=64 kernel wall is hidden) — the last
-## untried tracked-metric lever; faithfulness (AWQ vs EXP-O's naive top5 0.6-0.7) is the gate.
+## int4 gate_up at b1 (AWQ faithfulness probe) — DEAD
+At b1 the gate_up GEMM is a bandwidth-bound GEMV, so the K=64 kernel wall that killed int4
+at M=128 (EXP-14/O) is HIDDEN — int4 (58.7MB, fits L2) would halve the read. So the only
+blocker at b1 is faithfulness. Probe (faith_awq_int4_gateup.py): naive int4 g64 gate_up ->
+argmax 1.0, top5 0.80, top50 0.98, logit_rel 0.11. AWQ (activation-aware scaling, foldable
+into mlp_norm for free) a=0.5 -> top5 1.0 but top50 DROPS to 0.90 and rel WORSENS to 0.14;
+a=1.0 worse. AWQ trades top5 for top50/rel — no clean win, and rel stays ~2x the int8 bar.
+Too lossy for faithful sampling. int4 gate_up is now DEAD at ALL batch sizes (kernel wall
+at b128, faithfulness wall at b1).
+
+## EXP-23 — W8A8 int8 qkv+gate_up at PREFILL (M>16) — KEEP (TTFT -30%, peak_vram -7.1GB)
+Prefill GEMMs were weight-only W8A16 (int8 weight, bf16 MMA). The per-token int8 activation
+is ALREADY emitted by add_norm_quant at prefill (was unused — the W8A16 path read the bf16
+normed). Route qkv + the fused gate_up+SwiGLU through the int8 tensor-core W8A8 path for M>16
+(covers the b128 decode bucket AND prefill M>256). Standalone at prefill M: qkv 2.3x, gate_up
+1.9x vs W8A16 (int8 MMA ~2x bf16 at large M; bench prefill_w8a8_check.py). KEY VRAM win: the
+fused W8A8 swiglu never materialises the (M, 2*intermediate) bf16 combined tensor the W8A16
+path does (~7GB at b128 x 1004-token prefill); also stop emitting the now-dead bf16 normed
+at prefill (emit_bf16 = M<=16). RESULT (full sweep): TTFT instruct b128 365.7->249.8ms (-32%),
+code 5342->3707, summarize 14074->9818, long_ctx ->9368 (all ~-30%); peak_vram 35.82->28.72
+(-7.1GB!); best_agg_tps 10018 (flat, decode untouched), seq_tps_b1 100.3 (flat). Coherent
+(left-padded greedy: Paris/299792458 m/s/1789/Everest 29000ft — all correct). GOTCHA: added
+int64 output offsets to _w8a8_gemm + _w8a8_swiglu_fwd (prefill M*N nears int32 at long ctx).
+The earlier "batch garbage" in the gate was a RIGHT-padding test bug, not W8A8. KEEP.
+
+## EXP-24 — W8A8 int8 down at PREFILL (M>64) — KEEP (TTFT another -13%, cumulative -40%)
+Extend down's W8A8 bucket from 64<M<=256 to all M>64 (decode bucket + prefill). down was the
+last bf16-MMA prefill GEMM (~85ms at instruct b128). Its self-quant int8 act (M x 14336,
+~1.8GB transient at b128 x 1k-tok) fits the headroom EXP-23 freed. RESULT: TTFT instruct b128
+249.8->216.4ms, summarize 9818->8516, long_ctx 9368->8102 (~-13% more; CUMULATIVE EXP-23+24
+= -40% vs baseline: instruct 366->216ms, summarize 14074->8516ms). peak_vram 28.72->30.30
+(+1.6GB down self-quant, still -5.5GB vs baseline). best_agg_tps 9876 / seq_tps_b1 100.8
+(both flat, decode/b1 untouched — the dip is thermal noise). Coherent. KEEP.
+
+## jun30 SESSION FINAL — 4 wins, best_agg_tps walled, frontier expanded
+EXP-21 sampler (+0.73% headline), EXP-22 o_proj b1-b64 (+5.9% seq_tps_b1), EXP-23 prefill
+qkv+gate_up W8A8 (TTFT -30%, VRAM -7GB), EXP-24 prefill down W8A8 (TTFT cumulative -40%).
+Net frontier: interactivity (seq_tps_b1) +5.9%, TTFT -40%, peak_vram -5.5GB, decode headline
+flat (~10000, int8 GEMM wall). Comprehensive DEAD confirmations: int4 GEMM (b128 kernel),
+int4 gate_up b1 (AWQ faithfulness), int4 KV (grouped, faithfulness), GQA flash (L2-absorbed),
+gate_up + b1 W8A16 tiles (optimal). The decode headline needs a Marlin-grade int4 GEMM
+(beyond Triton + borderline faithfulness) — not a loop iteration. See CHECKPOINT.md.

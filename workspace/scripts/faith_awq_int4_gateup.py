@@ -102,7 +102,7 @@ def quant_variants(alpha):
         s = s / s.mean()                       # normalize to keep magnitudes sane
         w_awq = w * s[None, :]                 # fold s into weight columns
         wq = int4_g(w_awq, G)
-        awq.append(wq / s[None, :])            # un-fold (== quantized x@W.T identity)
+        awq.append((wq / s[None, :]).to(DT))   # un-fold (== quantized x@W.T identity)
     return naive, awq
 
 test = "In a shocking turn of events, scientists announced today that"
