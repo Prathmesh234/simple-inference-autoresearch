@@ -170,7 +170,13 @@ class SwiGLUMLP(nn.Module):
             # activation-quant launch and the separate swiglu launch and never
             # materialising the (M, 2*intermediate) tensor.
             M = x.reshape(-1, x.shape[-1]).shape[0]
-            if x_int8 is not None and 16 < M <= 256:
+            # Fused W8A8 gate_up+SwiGLU for M>16 — the b128 decode bucket AND prefill
+            # (M>256). At prefill the int8 MMA runs ~1.9x the W8A16 path (TTFT win) AND
+            # never materialises the (M, 2*intermediate) bf16 combined tensor the W8A16
+            # path does (at b128 x ~1k-token prefill that intermediate is ~7 GB), so it
+            # also lowers peak prefill VRAM. M<=16 (b1) stays W8A16. Output offsets are
+            # int64 (prefill M*I safe).
+            if x_int8 is not None and M > 16:
                 fused = w8a8_swiglu_prequant(
                     x_int8, x_scale, self.w_gate_up_int8, self.w_gate_up_scale,
                     x.shape,
@@ -189,12 +195,13 @@ class SwiGLUMLP(nn.Module):
             # bf16) pay off: W8A8 runs the GEMM ~1.9x faster than the W8A16
             # (weight-int8, bf16-MMA) path. The SwiGLU output has no free per-row
             # int8 quant (it is not produced by a norm), so the W8A8 path pays a
-            # standalone per-token quant; net it still wins in the decode bucket.
-            # b1 (M<=16) and prefill (M>256) keep W8A16 (no int8-MMA win there).
-            # The standalone per-token quant (K=14336) only amortises once M is
-            # large enough to fill the SMs: it wins at M>=128 (the b128 headline)
-            # but loses at M=32/64, so the down W8A8 bucket starts above 64.
-            if 64 < M <= 256:
+            # standalone per-token quant. b1 (M<=16) and small M<=64 keep W8A16
+            # (the K=14336 per-token quant is occupancy-starved there, EXP-M). At
+            # M>64 — the b128 decode bucket AND prefill (M>256) — the int8 MMA win
+            # (~2.3x at large M) dwarfs the quant cost: ship W8A8. The self-quant
+            # int8 act (M x 14336) is a transient (~1.8 GB at b128 x 1k-token
+            # prefill), comfortably within the headroom EXP-23 freed.
+            if M > 64:
                 return w8a8_down_linear(fused, self.w_down_int8, self.w_down_scale)
             return w8a16_linear_triton(fused, self.w_down_int8, self.w_down_scale)
 

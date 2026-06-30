@@ -32,7 +32,17 @@ This matches what `model(...)[:, -1, :]` produces in the decode loop.
 
 from __future__ import annotations
 
+import os
+
 import torch
+
+# Fused Triton top-k/top-p/sample kernel toggle (EXP-21). Default on; set
+# USE_FUSED_SAMPLE=false to fall back to the pure-torch top-k fast path (for
+# same-window A/B comparison or debugging). Faithful either way — the fused
+# kernel's distribution is bit-identical to the torch tail.
+USE_FUSED_SAMPLE = os.environ.get("USE_FUSED_SAMPLE", "true").lower() in (
+    "1", "true", "yes", "on",
+)
 
 
 # ── temperature ──────────────────────────────────────────────────────────────
@@ -177,6 +187,19 @@ def sample(
         # keeps all logits >= the k-th value, so an exact bf16 tie at the k-th
         # rank picks a slightly different candidate set — the standard exact-k
         # top-k semantics, immaterial to output quality.)
+        #
+        # On CUDA, fuse the entire post-top-k tail (temperature, the float32 top-p
+        # nucleus, renormalised softmax, and the categorical draw) into ONE Triton
+        # launch (kernels/sampling_kernel.fused_topk_sample). sample() is the only
+        # eager work left on the decode critical path (the model forward is a CUDA
+        # graph replay), so collapsing ~9 small ops — including the expensive
+        # aten::multinomial — into a single kernel removes their per-step CPU
+        # dispatch + profiler allocation tax. Bit-identical distribution to the
+        # torch tail below (gate: bench_fused_sample_compare.py, max|Δprob|=0).
+        if USE_FUSED_SAMPLE and logits.is_cuda:
+            from kernels.sampling_kernel import fused_topk_sample
+            return fused_topk_sample(logits, temperature, top_k, top_p)
+
         vals, idx = torch.topk(logits, top_k, dim=-1, largest=True, sorted=True)
 
         # Temperature is a strictly monotonic scaling, so top-k(logits/T) picks

@@ -100,7 +100,11 @@ def _w8a8_gemm(x_ptr, w_ptr, xs_ptr, ws_ptr, y_ptr, M, N, K,
 
     offs_ym = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_yn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    y_ptrs = y_ptr + offs_ym[:, None] * sym + offs_yn[None, :] * syn
+    # 64-bit row offset: at prefill M (e.g. b128 x ~1004 tokens -> M~128512) the
+    # product offs_ym*sym (= M*N) approaches/exceeds int32 range, which would wrap
+    # to a negative address (illegal memory access). Promote to int64 (decode M is
+    # tiny so this is free there). Same fix the W8A16 kernel already carries.
+    y_ptrs = y_ptr + offs_ym[:, None].to(tl.int64) * sym + offs_yn[None, :] * syn
     tl.store(y_ptrs, y.to(tl.bfloat16),
              mask=(offs_ym[:, None] < M) & (offs_yn[None, :] < N))
 
@@ -212,7 +216,8 @@ def _w8a8_swiglu_fwd(x_ptr, w_ptr, xs_ptr, ws_ptr, y_ptr, M, I, K,
 
     offs_ym = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_yn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    y_ptrs = y_ptr + offs_ym[:, None] * sym + offs_yn[None, :] * syn
+    # int64 row offset for prefill M (M*I can approach int32 range at long context).
+    y_ptrs = y_ptr + offs_ym[:, None].to(tl.int64) * sym + offs_yn[None, :] * syn
     tl.store(y_ptrs, out.to(tl.bfloat16),
              mask=(offs_ym[:, None] < M) & (offs_yn[None, :] < I))
 
