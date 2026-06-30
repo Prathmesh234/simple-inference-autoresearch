@@ -150,6 +150,31 @@ last bf16-MMA prefill GEMM (~85ms at instruct b128). Its self-quant int8 act (M 
 (+1.6GB down self-quant, still -5.5GB vs baseline). best_agg_tps 9876 / seq_tps_b1 100.8
 (both flat, decode/b1 untouched — the dip is thermal noise). Coherent. KEEP.
 
+## Serving-layer optimizations (paged / radix / continuous / chunked / spec) — examined, DEAD for the FIXED profiler
+User-requested deep look. These are SCHEDULER/serving-layer techniques; the profiler is a
+SYNTHETIC uniform-batch benchmark that structurally neutralizes every one of them:
+- **Paged KV cache** (model/paged_kv_cache.py + kernels/paged_flash_decode_kernel.py, jun28
+  WIP): re-MEASURED fresh on this box (paged vs contiguous flash, bf16, b128): kv64 (the
+  instruct headline) **0.95x** (block-table-load overhead), kv256/1024 1.04-1.06x (noise),
+  bit-identical. Pool is sized max_batch*max_blocks_per_seq = SAME as contiguous (allocate()
+  assigns SEQUENTIAL blocks per request -> same access pattern), so NO VRAM win either. The
+  profiler RIGHT-SIZES the contiguous KV per cell (prompt+new_tokens) so there's no
+  over-reservation to reclaim, and after int8-KV + EXP-23 there's no OOM to avoid. Wiring it
+  would REGRESS the headline ~5%. DEAD.
+- **Radix / prefix reuse**: profiler pulls DISTINCT prompts per batch -> they share ~only BOS
+  (1 token). Zero reuse. And prefix-skip would cut PREFILL (TTFT), which is NOT in the tracked
+  summary anyway. DEAD.
+- **Variable-length / skip-pad decode** (the one paged principle that could speed the
+  high-padding cells like code b128, prompts 90-391): IMPOSSIBLE — the profiler passes NO
+  attention_mask (only input_ids), and pad==EOS is indistinguishable from real EOS, so the
+  engine cannot identify padding. Hard interface wall. DEAD.
+- **Continuous batching**: fixed batch per cell, no dynamic arrival. **Chunked prefill**:
+  doesn't change decode throughput. **Speculative decode**: profiler hardcodes 1 token/model
+  call + external sample(). All structurally incompatible.
+KEY INSIGHT: the profiler measures the ENGINE (kernels/numerics) on unknown UNIFORM inputs,
+NOT a serving scheduler. So best_agg_tps is moved ONLY by kernel/numeric levers (all maxed:
+W8A8 everywhere, tiles optimal, int4 dead, sampler fused) — never by serving-layer scheduling.
+
 ## jun30 SESSION FINAL — 4 wins, best_agg_tps walled, frontier expanded
 EXP-21 sampler (+0.73% headline), EXP-22 o_proj b1-b64 (+5.9% seq_tps_b1), EXP-23 prefill
 qkv+gate_up W8A8 (TTFT -30%, VRAM -7GB), EXP-24 prefill down W8A8 (TTFT cumulative -40%).
