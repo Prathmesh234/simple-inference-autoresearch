@@ -170,7 +170,13 @@ class SwiGLUMLP(nn.Module):
             # activation-quant launch and the separate swiglu launch and never
             # materialising the (M, 2*intermediate) tensor.
             M = x.reshape(-1, x.shape[-1]).shape[0]
-            if x_int8 is not None and 16 < M <= 256:
+            # Fused W8A8 gate_up+SwiGLU for M>16 — the b128 decode bucket AND prefill
+            # (M>256). At prefill the int8 MMA runs ~1.9x the W8A16 path (TTFT win) AND
+            # never materialises the (M, 2*intermediate) bf16 combined tensor the W8A16
+            # path does (at b128 x ~1k-token prefill that intermediate is ~7 GB), so it
+            # also lowers peak prefill VRAM. M<=16 (b1) stays W8A16. Output offsets are
+            # int64 (prefill M*I safe).
+            if x_int8 is not None and M > 16:
                 fused = w8a8_swiglu_prequant(
                     x_int8, x_scale, self.w_gate_up_int8, self.w_gate_up_scale,
                     x.shape,

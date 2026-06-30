@@ -153,7 +153,13 @@ class GroupedQueryAttention(nn.Module):
         """
         if USE_TRITON and x.is_cuda:
             M = B * T
-            if x_int8 is not None and 16 < M <= 256:
+            # W8A8 int8 tensor-core qkv for M>16 — both the b128 decode bucket AND
+            # prefill (M>256). The int8 activation comes free from the fused
+            # attn_norm.add_norm_quant. At prefill (large M) the int8 MMA runs ~2.3x
+            # the W8A16 (upcast) path (TTFT win). M<=16 (b1) stays W8A16 (no int8-MMA
+            # benefit at GEMV-tiny M). The kernel's output offsets are int64 (prefill
+            # M*N safe).
+            if x_int8 is not None and M > 16:
                 from kernels.w8a8_gemm_kernel import w8a8_qkv_prequant
                 qkv = w8a8_qkv_prequant(
                     x_int8, x_scale, self.w_qkv_int8, self.w_qkv_scale, x.shape

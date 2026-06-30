@@ -145,13 +145,14 @@ class TransformerBlock(nn.Module):
             still pending, to be folded into the next norm); residual is the
             stream after the attention add.
         """
-        # In the W8A8 decode bucket (16 < M <= 256, the b128 headline) the qkv and
-        # gate_up GEMMs consume only the int8 activation + scale that the fused norm
-        # emits, so the norm's bf16 normed output is dead — tell add_norm_quant to
-        # skip that 1 MB/row store. Outside the bucket (b1 / prefill) the W8A16
-        # fallback reads the bf16 normed, so it must still be written.
+        # The bf16 normed output is consumed ONLY by the W8A16 fallback, which now
+        # runs solely at M<=16 (b1 decode). Everywhere else — the b128 decode bucket
+        # (16<M<=256) AND prefill (M>256) — qkv and gate_up are W8A8 and read only the
+        # int8 activation + scale the fused norm emits, so the bf16 normed is dead
+        # traffic. Emit it only for M<=16. At prefill this also frees the bf16 normed
+        # write (~1 MB/row), and pairs with the W8A8 prefill GEMMs below.
         M = x.shape[0] * x.shape[1]
-        emit_bf16 = not (16 < M <= 256)
+        emit_bf16 = M <= 16
 
         # --- 1. Attention block ---
         # First block seeds the residual from the embedding (no pending add); later
