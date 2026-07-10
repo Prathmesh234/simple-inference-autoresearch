@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 from transformers import DynamicCache, Qwen3_5ForCausalLM, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5RMSNorm,
     Qwen3_5TextRotaryEmbedding,
 )
 
@@ -33,6 +34,9 @@ USE_QWEN_GDN_KERNEL = os.environ.get("USE_QWEN_GDN_KERNEL", "true").lower() in (
 USE_QWEN_INPLACE_CACHE = os.environ.get(
     "USE_QWEN_INPLACE_CACHE", "true"
 ).lower() in ("1", "true", "yes", "on")
+USE_QWEN_RMSNORM_KERNEL = os.environ.get(
+    "USE_QWEN_RMSNORM_KERNEL", "true"
+).lower() in ("1", "true", "yes", "on")
 
 
 def load_qwen35_config(path: str | Path) -> Qwen3_5TextConfig:
@@ -47,6 +51,16 @@ def qwen35_checkpoint_name(state_name: str) -> str:
     if state_name.startswith("model."):
         return f"model.language_model.{state_name[len('model.'):]}"
     return state_name
+
+
+def _qwen35_rmsnorm_forward(
+    module: Qwen3_5RMSNorm, x: torch.Tensor
+) -> torch.Tensor:
+    from kernels.rmsnorm_kernel import rmsnorm_triton
+
+    return rmsnorm_triton(
+        x, module.weight, module.eps, weight_offset=1.0
+    )
 
 
 class Qwen35DynamicCache(DynamicCache):
@@ -129,6 +143,12 @@ class Qwen35Model(nn.Module):
                 linear_attn = getattr(layer, "linear_attn", None)
                 if linear_attn is not None:
                     linear_attn.recurrent_gated_delta_rule = gated_delta_recurrent
+        if USE_QWEN_RMSNORM_KERNEL:
+            for module in self.backbone.modules():
+                if isinstance(module, Qwen3_5RMSNorm):
+                    module.forward = _qwen35_rmsnorm_forward.__get__(
+                        module, Qwen3_5RMSNorm
+                    )
 
     @torch.no_grad()
     def forward(

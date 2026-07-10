@@ -23,6 +23,7 @@ full-attention layers. All 427 text tensors map exactly.
 | Fused Triton single-token Gated DeltaNet recurrence | kernel 147.3 -> 13.2 us (11.15x); warmed model 20.9 -> 24.1 tok/s (+15.3%) | KEEP |
 | Skip recurrent cache self-copy after in-place fused update | 23.2 -> 24.3 tok/s (+4.7%); identical 96-token greedy output | KEEP |
 | Static full-attention KV cache, sized to request maximum | 22.9 -> 23.0 tok/s (+0.4%); identical 96-token greedy output | DISCARD: fixed-length attention offsets avoided concatenation |
+| Fused Triton RMSNorm for Qwen hidden and strided Q/K norms | 23.5 -> 25.7 tok/s (+9.4%); standalone 3.5-8.6x; identical 96-token greedy output | KEEP |
 
 ### Why the fused recurrence wins
 
@@ -38,3 +39,9 @@ Transformers' generic cache path copied that tensor back onto itself after
 every linear-attention layer. Detecting the storage alias avoids 24 redundant
 state update calls per decoded token while preserving the original cache path
 for prefill and non-aliased updates.
+
+The Qwen RMSNorm path also stores scale as an offset from one and applies norms
+to strided Q/K projection views. Extending the shared Triton kernel with a
+compile-time weight offset and independent contiguous output addressing reduces
+each eager multi-kernel norm to one launch. The strided regression case is part
+of the RMSNorm benchmark gate.
