@@ -25,6 +25,7 @@ full-attention layers. All 427 text tensors map exactly.
 | Static full-attention KV cache, sized to request maximum | 22.9 -> 23.0 tok/s (+0.4%); identical 96-token greedy output | DISCARD: fixed-length attention offsets avoided concatenation |
 | Fused Triton RMSNorm for Qwen hidden and strided Q/K norms | 23.5 -> 25.7 tok/s (+9.4%); standalone 3.5-8.6x; identical 96-token greedy output | KEEP |
 | Reuse fused Triton SwiGLU in Qwen MLP | 26.6 -> 24.0 tok/s (-9.8%); identical 96-token greedy output | DISCARD: Triton tiled dispatch costs more than two eager batch-1 elementwise kernels |
+| Fused single-token causal depthwise-convolution state update | kernel 13.6 -> 8.6 us (1.58x); model 25.6 -> 27.4 tok/s (+7.0%); identical 96-token greedy output | KEEP |
 
 ### Why the fused recurrence wins
 
@@ -46,3 +47,9 @@ to strided Q/K projection views. Extending the shared Triton kernel with a
 compile-time weight offset and independent contiguous output addressing reduces
 each eager multi-kernel norm to one launch. The strided regression case is part
 of the RMSNorm benchmark gate.
+
+The DeltaNet convolution fallback concatenated old state and input, copied the
+new state, launched grouped Conv1d, sliced, and applied SiLU independently in
+all 24 recurrent layers. The decode-only kernel shifts each four-value state,
+computes the depthwise dot product, applies SiLU, and writes the token in one
+launch. Prefill continues to use the framework path.

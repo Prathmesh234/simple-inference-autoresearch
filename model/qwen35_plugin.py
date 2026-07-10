@@ -37,6 +37,9 @@ USE_QWEN_INPLACE_CACHE = os.environ.get(
 USE_QWEN_RMSNORM_KERNEL = os.environ.get(
     "USE_QWEN_RMSNORM_KERNEL", "true"
 ).lower() in ("1", "true", "yes", "on")
+USE_QWEN_CAUSAL_CONV_KERNEL = os.environ.get(
+    "USE_QWEN_CAUSAL_CONV_KERNEL", "true"
+).lower() in ("1", "true", "yes", "on")
 
 
 def load_qwen35_config(path: str | Path) -> Qwen3_5TextConfig:
@@ -143,6 +146,15 @@ class Qwen35Model(nn.Module):
                 linear_attn = getattr(layer, "linear_attn", None)
                 if linear_attn is not None:
                     linear_attn.recurrent_gated_delta_rule = gated_delta_recurrent
+        if USE_QWEN_CAUSAL_CONV_KERNEL:
+            from kernels.causal_conv1d_update_kernel import (
+                causal_conv1d_update,
+            )
+
+            for layer in self.backbone.model.layers:
+                linear_attn = getattr(layer, "linear_attn", None)
+                if linear_attn is not None:
+                    linear_attn.causal_conv1d_update = causal_conv1d_update
         if USE_QWEN_RMSNORM_KERNEL:
             for module in self.backbone.modules():
                 if isinstance(module, Qwen3_5RMSNorm):
