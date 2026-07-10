@@ -76,6 +76,7 @@ def _load_builtin_plugins() -> None:
     if _BUILTINS_LOADED:
         return
     from model import llama_plugin  # noqa: F401
+    from model import qwen35_plugin  # noqa: F401
 
     _BUILTINS_LOADED = True
 
