@@ -10,6 +10,7 @@ callers to Transformers or to Qwen-specific cache state.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -21,6 +22,14 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 
 from loader import WeightLoader
 from model.registry import ModelPlugin, register_model_plugin
+
+
+USE_QWEN_GDN_KERNEL = os.environ.get("USE_QWEN_GDN_KERNEL", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 def load_qwen35_config(path: str | Path) -> Qwen3_5TextConfig:
@@ -91,6 +100,13 @@ class Qwen35Model(nn.Module):
         self.backbone.model.rotary_emb = Qwen3_5TextRotaryEmbedding(
             self.cfg, device=self.device
         )
+        if USE_QWEN_GDN_KERNEL:
+            from kernels.gated_delta_recurrent_kernel import gated_delta_recurrent
+
+            for layer in self.backbone.model.layers:
+                linear_attn = getattr(layer, "linear_attn", None)
+                if linear_attn is not None:
+                    linear_attn.recurrent_gated_delta_rule = gated_delta_recurrent
 
     @torch.no_grad()
     def forward(
