@@ -80,7 +80,7 @@ class Tokenizer:
         you feed to the model.
         """
         ids = self._tok.encode(text, add_special_tokens=False)
-        if add_bos:
+        if add_bos and self.bos_id is not None:
             ids = [self.bos_id] + ids
         return ids
 
