@@ -15,6 +15,9 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from transformers import DynamicCache, Qwen3_5ForCausalLM, Qwen3_5TextConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5TextRotaryEmbedding,
+)
 
 from loader import WeightLoader
 from model.registry import ModelPlugin, register_model_plugin
@@ -82,6 +85,12 @@ class Qwen35Model(nn.Module):
             for name in self.backbone.state_dict()
         }
         self.backbone.load_state_dict(state, strict=True, assign=True)
+        # Non-persistent buffers are absent from state_dict and therefore remain
+        # on meta after direct parameter assignment. Rebuild the tiny RoPE module
+        # on the target device before registry finalization calls Module.to().
+        self.backbone.model.rotary_emb = Qwen3_5TextRotaryEmbedding(
+            self.cfg, device=self.device
+        )
 
     @torch.no_grad()
     def forward(
