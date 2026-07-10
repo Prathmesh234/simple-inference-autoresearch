@@ -22,6 +22,7 @@ full-attention layers. All 427 text tensors map exactly.
 | `torch.compile(mode="reduce-overhead")` on the Qwen backbone | CUDAGraph output alias crash from mutable recurrent/KV cache | CRASH: dynamic cache needs explicit static-address integration |
 | Fused Triton single-token Gated DeltaNet recurrence | kernel 147.3 -> 13.2 us (11.15x); warmed model 20.9 -> 24.1 tok/s (+15.3%) | KEEP |
 | Skip recurrent cache self-copy after in-place fused update | 23.2 -> 24.3 tok/s (+4.7%); identical 96-token greedy output | KEEP |
+| Static full-attention KV cache, sized to request maximum | 22.9 -> 23.0 tok/s (+0.4%); identical 96-token greedy output | DISCARD: fixed-length attention offsets avoided concatenation |
 
 ### Why the fused recurrence wins
 
