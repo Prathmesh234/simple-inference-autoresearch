@@ -21,6 +21,7 @@ full-attention layers. All 427 text tensors map exactly.
 | Selective W8A16 for Qwen projections with output width >=4096 | 19.4 -> 15.0 tok/s; VRAM 17.96 -> 10.10 GB | DISCARD: standalone GEMV wins did not survive full-model dispatch |
 | `torch.compile(mode="reduce-overhead")` on the Qwen backbone | CUDAGraph output alias crash from mutable recurrent/KV cache | CRASH: dynamic cache needs explicit static-address integration |
 | Fused Triton single-token Gated DeltaNet recurrence | kernel 147.3 -> 13.2 us (11.15x); warmed model 20.9 -> 24.1 tok/s (+15.3%) | KEEP |
+| Skip recurrent cache self-copy after in-place fused update | 23.2 -> 24.3 tok/s (+4.7%); identical 96-token greedy output | KEEP |
 
 ### Why the fused recurrence wins
 
@@ -30,3 +31,9 @@ many eager PyTorch kernels for each of 24 linear-attention layers. The fused
 kernel tiles the `(128, 128)` recurrent state by value dimension and performs
 the complete update in one launch while each state tile is resident. It removes
 launch overhead and intermediate traffic without changing the greedy output.
+
+The fused kernel returns the same recurrent-state storage that it updates.
+Transformers' generic cache path copied that tensor back onto itself after
+every linear-attention layer. Detecting the storage alias avoids 24 redundant
+state update calls per decoded token while preserving the original cache path
+for prefill and non-aliased updates.

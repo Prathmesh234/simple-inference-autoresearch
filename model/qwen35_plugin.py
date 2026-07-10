@@ -30,6 +30,9 @@ USE_QWEN_GDN_KERNEL = os.environ.get("USE_QWEN_GDN_KERNEL", "true").lower() in (
     "yes",
     "on",
 )
+USE_QWEN_INPLACE_CACHE = os.environ.get(
+    "USE_QWEN_INPLACE_CACHE", "true"
+).lower() in ("1", "true", "yes", "on")
 
 
 def load_qwen35_config(path: str | Path) -> Qwen3_5TextConfig:
@@ -44,6 +47,25 @@ def qwen35_checkpoint_name(state_name: str) -> str:
     if state_name.startswith("model."):
         return f"model.language_model.{state_name[len('model.'):]}"
     return state_name
+
+
+class Qwen35DynamicCache(DynamicCache):
+    """Skip copies when a custom kernel has already updated state in place."""
+
+    def update_recurrent_state(
+        self, recurrent_states: torch.Tensor, layer_idx: int, **kwargs
+    ) -> torch.Tensor:
+        layer = self.layers[layer_idx]
+        cached = getattr(layer, "recurrent_states", None)
+        if (
+            USE_QWEN_INPLACE_CACHE
+            and cached is not None
+            and recurrent_states.data_ptr() == cached.data_ptr()
+        ):
+            return recurrent_states
+        return super().update_recurrent_state(
+            recurrent_states, layer_idx, **kwargs
+        )
 
 
 class Qwen35Cache:
@@ -62,7 +84,7 @@ class Qwen35Cache:
         self.max_seq_len = max_seq_len
         self.dtype = dtype
         self.device = torch.device(device)
-        self.cache = DynamicCache(config=config)
+        self.cache = Qwen35DynamicCache(config=config)
 
     def reset(self) -> None:
         self.cache.reset()
