@@ -18,6 +18,7 @@ import torch.nn as nn
 from transformers import DynamicCache, Qwen3_5ForCausalLM, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5RMSNorm,
+    Qwen3_5RMSNormGated,
     Qwen3_5TextRotaryEmbedding,
 )
 
@@ -39,6 +40,9 @@ USE_QWEN_RMSNORM_KERNEL = os.environ.get(
 ).lower() in ("1", "true", "yes", "on")
 USE_QWEN_CAUSAL_CONV_KERNEL = os.environ.get(
     "USE_QWEN_CAUSAL_CONV_KERNEL", "true"
+).lower() in ("1", "true", "yes", "on")
+USE_QWEN_GATED_RMSNORM_KERNEL = os.environ.get(
+    "USE_QWEN_GATED_RMSNORM_KERNEL", "true"
 ).lower() in ("1", "true", "yes", "on")
 
 
@@ -63,6 +67,18 @@ def _qwen35_rmsnorm_forward(
 
     return rmsnorm_triton(
         x, module.weight, module.eps, weight_offset=1.0
+    )
+
+
+def _qwen35_gated_rmsnorm_forward(
+    module: Qwen3_5RMSNormGated,
+    hidden_states: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    from kernels.gated_rmsnorm_kernel import gated_rmsnorm
+
+    return gated_rmsnorm(
+        hidden_states, gate, module.weight, module.variance_epsilon
     )
 
 
@@ -160,6 +176,12 @@ class Qwen35Model(nn.Module):
                 if isinstance(module, Qwen3_5RMSNorm):
                     module.forward = _qwen35_rmsnorm_forward.__get__(
                         module, Qwen3_5RMSNorm
+                    )
+        if USE_QWEN_GATED_RMSNORM_KERNEL:
+            for module in self.backbone.modules():
+                if isinstance(module, Qwen3_5RMSNormGated):
+                    module.forward = _qwen35_gated_rmsnorm_forward.__get__(
+                        module, Qwen3_5RMSNormGated
                     )
 
     @torch.no_grad()

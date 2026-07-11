@@ -26,6 +26,7 @@ full-attention layers. All 427 text tensors map exactly.
 | Fused Triton RMSNorm for Qwen hidden and strided Q/K norms | 23.5 -> 25.7 tok/s (+9.4%); standalone 3.5-8.6x; identical 96-token greedy output | KEEP |
 | Reuse fused Triton SwiGLU in Qwen MLP | 26.6 -> 24.0 tok/s (-9.8%); identical 96-token greedy output | DISCARD: Triton tiled dispatch costs more than two eager batch-1 elementwise kernels |
 | Fused single-token causal depthwise-convolution state update | kernel 13.6 -> 8.6 us (1.58x); model 25.6 -> 27.4 tok/s (+7.0%); identical 96-token greedy output | KEEP |
+| Fused DeltaNet RMSNorm and SiLU gate | kernel 66.9 -> 4.4 us (15.35x); model 25.1 -> 28.2 tok/s (+12.4%); exact bf16 parity and identical 96-token greedy output | KEEP |
 
 ### Why the fused recurrence wins
 
@@ -53,3 +54,8 @@ new state, launched grouped Conv1d, sliced, and applied SiLU independently in
 all 24 recurrent layers. The decode-only kernel shifts each four-value state,
 computes the depthwise dot product, applies SiLU, and writes the token in one
 launch. Prefill continues to use the framework path.
+
+The DeltaNet output gate previously used casts, square, mean, reciprocal root,
+normalization, weight scaling, SiLU, multiplication, and a final cast as eager
+operations. The fused kernel preserves Qwen's norm-before-gate ordering and
+bf16 intermediate rounding while collapsing that sequence to one launch.
