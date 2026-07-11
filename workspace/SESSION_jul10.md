@@ -38,6 +38,7 @@ the original Qwen decode baseline.
 | Combine Qwen MLP gate/up projections | 27.7 -> 28.3 tok/s (+2.2%); TTFT 207.5 -> 186.1 ms (-10.3%); projection output exact | KEEP |
 | Combine four DeltaNet input projections | 27.4 -> 29.7 tok/s (+8.4%); same output SHA-256; VRAM unchanged | KEEP |
 | Combine Q/K/V projections in eight full-attention layers | 31.1 -> 29.2 tok/s (-6.1%); TTFT 188.1 -> 217.6 ms; output exact | DISCARD: wider shape selects a slower GEMV path |
+| Static-cache CUDA Graph replay for batch-1 decode | 29.5 -> 45.9 tok/s (+55.6%), but short-prompt greedy output diverged from eager | DISCARD: static-cache attention changed token selection |
 
 ### Why the fused recurrence wins
 
@@ -85,3 +86,9 @@ Each DeltaNet layer similarly launched separate QKV, output-gate, beta, and
 decay projections. A unified weight produces all four channel ranges in one
 GEMV before splitting views, reducing 96 projection launches per token to 24
 without changing the generated output.
+
+CUDA Graph replay removed most Python launch overhead and added only 0.02 GB
+VRAM, but its static full-attention cache changed numerical reduction behavior.
+On a five-token prompt, eager generated "guesses or draw conclusions" while
+the graph path generated "guesses or deductions". Exact greedy parity is a
+retention gate, so the graph implementation was removed.
