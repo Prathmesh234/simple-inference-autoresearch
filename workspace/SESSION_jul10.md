@@ -31,7 +31,7 @@ the original Qwen decode baseline.
 | Static full-attention KV cache, sized to request maximum | 22.9 -> 23.0 tok/s (+0.4%); identical 96-token greedy output | DISCARD: fixed-length attention offsets avoided concatenation |
 | Fused Triton RMSNorm for Qwen hidden and strided Q/K norms | 23.5 -> 25.7 tok/s (+9.4%); standalone 3.5-8.6x; identical 96-token greedy output | KEEP |
 | Reuse fused Triton SwiGLU in Qwen MLP | 26.6 -> 24.0 tok/s (-9.8%); identical 96-token greedy output | DISCARD: Triton tiled dispatch costs more than two eager batch-1 elementwise kernels |
-| Fused single-token causal depthwise-convolution state update | initially 25.6 -> 27.4 tok/s (+7.0%), but tested before the dynamic-cache reset bug was found | REMOVED: determinism conclusion was confounded; retest after cache fix |
+| Fused single-token causal depthwise-convolution state update | corrected 5-run median 29.1 -> 28.5 tok/s (-2.1%); deterministic after cache fix | DISCARD: one Triton launch loses to optimized framework conv at the retained baseline |
 | Fused DeltaNet RMSNorm and SiLU gate | kernel 66.9 -> 4.4 us (15.35x); model 25.1 -> 28.2 tok/s (+12.4%); exact bf16 parity and identical 96-token greedy output | KEEP |
 | PyTorch SDPA for eight full-attention layers | 28.0 -> 27.9 tok/s (-0.4%); TTFT 217.9 -> 235.7 ms | DISCARD: short batch-1 attention does not amortize backend overhead |
 | Clear dynamic full-attention KV length on cache reset | repeated requests had retained zero-filled KV prefixes; reset now restores length zero | KEEP: fixes request isolation and benchmark repeatability |
@@ -60,9 +60,10 @@ of the RMSNorm benchmark gate.
 
 The attempted DeltaNet convolution kernel fused state shift, depthwise dot
 product, and SiLU. It was deterministic across 1,000 isolated resets and its
-state matched the reference exactly. Its full-model determinism result was
-confounded by a separate dynamic-cache reset bug, so the production path
-remains on the framework fallback until a clean retest.
+state matched the reference exactly. Its original determinism result was
+confounded by a separate dynamic-cache reset bug, but the corrected retest was
+stable and slower. The production path therefore remains on the framework
+fallback.
 
 The DeltaNet output gate previously used casts, square, mean, reciprocal root,
 normalization, weight scaling, SiLU, multiplication, and a final cast as eager
