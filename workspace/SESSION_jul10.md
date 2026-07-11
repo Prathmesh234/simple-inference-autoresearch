@@ -37,6 +37,7 @@ the original Qwen decode baseline.
 | Clear dynamic full-attention KV length on cache reset | repeated requests had retained zero-filled KV prefixes; reset now restores length zero | KEEP: fixes request isolation and benchmark repeatability |
 | Combine Qwen MLP gate/up projections | 27.7 -> 28.3 tok/s (+2.2%); TTFT 207.5 -> 186.1 ms (-10.3%); projection output exact | KEEP |
 | Combine four DeltaNet input projections | 27.4 -> 29.7 tok/s (+8.4%); same output SHA-256; VRAM unchanged | KEEP |
+| Combine Q/K/V projections in eight full-attention layers | 31.1 -> 29.2 tok/s (-6.1%); TTFT 188.1 -> 217.6 ms; output exact | DISCARD: wider shape selects a slower GEMV path |
 
 ### Why the fused recurrence wins
 
