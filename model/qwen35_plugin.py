@@ -15,7 +15,9 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import DynamicCache, Qwen3_5ForCausalLM, Qwen3_5TextConfig
+from transformers.cache_utils import DynamicLayer
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5RMSNorm,
     Qwen3_5RMSNormGated,
@@ -40,6 +42,9 @@ USE_QWEN_RMSNORM_KERNEL = os.environ.get(
 ).lower() in ("1", "true", "yes", "on")
 USE_QWEN_GATED_RMSNORM_KERNEL = os.environ.get(
     "USE_QWEN_GATED_RMSNORM_KERNEL", "true"
+).lower() in ("1", "true", "yes", "on")
+USE_QWEN_COMBINED_GATE_UP = os.environ.get(
+    "USE_QWEN_COMBINED_GATE_UP", "true"
 ).lower() in ("1", "true", "yes", "on")
 
 
@@ -82,6 +87,13 @@ def _qwen35_gated_rmsnorm_forward(
 class Qwen35DynamicCache(DynamicCache):
     """Skip copies when a custom kernel has already updated state in place."""
 
+    def reset(self) -> None:
+        super().reset()
+        for layer in self.layers:
+            if isinstance(layer, DynamicLayer) and layer.is_initialized:
+                layer.keys = layer.keys.new_empty(0)
+                layer.values = layer.values.new_empty(0)
+
     def update_recurrent_state(
         self, recurrent_states: torch.Tensor, layer_idx: int, **kwargs
     ) -> torch.Tensor:
@@ -96,6 +108,25 @@ class Qwen35DynamicCache(DynamicCache):
         return super().update_recurrent_state(
             recurrent_states, layer_idx, **kwargs
         )
+
+
+class Qwen35CombinedMLP(nn.Module):
+    """Qwen MLP with one combined gate/up projection."""
+
+    def __init__(self, mlp: nn.Module):
+        super().__init__()
+        self.gate_up_weight = nn.Parameter(
+            torch.cat((mlp.gate_proj.weight, mlp.up_proj.weight), dim=0),
+            requires_grad=False,
+        )
+        self.intermediate_size = mlp.gate_proj.out_features
+        self.down_proj = mlp.down_proj
+        self.act_fn = mlp.act_fn
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = F.linear(x, self.gate_up_weight)
+        gate, up = gate_up.split(self.intermediate_size, dim=-1)
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 class Qwen35Cache:
@@ -171,6 +202,9 @@ class Qwen35Model(nn.Module):
                     module.forward = _qwen35_gated_rmsnorm_forward.__get__(
                         module, Qwen3_5RMSNormGated
                     )
+        if USE_QWEN_COMBINED_GATE_UP:
+            for layer in self.backbone.model.layers:
+                layer.mlp = Qwen35CombinedMLP(layer.mlp)
 
     @torch.no_grad()
     def forward(

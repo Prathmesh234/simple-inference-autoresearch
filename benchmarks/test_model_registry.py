@@ -5,8 +5,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import torch
+from transformers import Qwen3_5TextConfig
+
 from model.registry import checkpoint_model_type, get_model_plugin
-from model.qwen35_plugin import load_qwen35_config, qwen35_checkpoint_name
+from model.qwen35_plugin import (
+    Qwen35DynamicCache,
+    load_qwen35_config,
+    qwen35_checkpoint_name,
+)
 
 
 class ModelRegistryTest(unittest.TestCase):
@@ -67,6 +74,26 @@ class ModelRegistryTest(unittest.TestCase):
             "model.language_model.layers.3.self_attn.q_proj.weight",
         )
         self.assertEqual(qwen35_checkpoint_name("lm_head.weight"), "lm_head.weight")
+
+    def test_qwen_cache_reset_clears_dynamic_sequence_length(self):
+        config = Qwen3_5TextConfig(
+            num_hidden_layers=1,
+            layer_types=["full_attention"],
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            hidden_size=16,
+        )
+        cache = Qwen35DynamicCache(config=config)
+        keys = torch.randn(1, 1, 3, 8)
+        values = torch.randn_like(keys)
+        cache.update(keys, values, layer_idx=0)
+        self.assertEqual(cache.get_seq_length(), 3)
+
+        cache.reset()
+
+        self.assertEqual(cache.get_seq_length(), 0)
+        self.assertEqual(cache.layers[0].keys.numel(), 0)
+        self.assertEqual(cache.layers[0].values.numel(), 0)
 
 
 if __name__ == "__main__":
