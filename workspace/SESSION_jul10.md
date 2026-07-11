@@ -9,7 +9,7 @@ Branch: `autoresearch/jul10`
 | Llama-3.1-8B | full fixed profiler, best aggregate | 8,837.7 | mixed sweep | 30.30 GB |
 | Llama-3.1-8B | full fixed profiler, batch 1 | 85.3 | mixed sweep | 30.30 GB |
 | Qwen3.5-9B | warmed greedy, batch 1 | 20.9 | 223.2 | 17.96 GB |
-| Qwen3.5-9B | retained path, 3-run median | 28.3 | 186.1 | 17.96 GB |
+| Qwen3.5-9B | retained path, 5-run median | 29.7 | 197.1 | 17.96 GB |
 
 The Qwen baseline uses the official text backbone behind the engine's model
 plugin contract. Its checkpoint has 32 layers: 24 Gated DeltaNet and eight
@@ -17,7 +17,7 @@ full-attention layers. All 427 text tensors map exactly.
 
 `benchmarks/bench_qwen.py` is the repeatable Qwen yardstick. It loads once,
 warms once, measures three 96-token greedy runs, reports medians, and fails if
-cache reuse changes generated output. The retained path is 35.4% faster than
+cache reuse changes generated output. The retained path is 42.1% faster than
 the original Qwen decode baseline.
 
 ## Experiments
@@ -36,6 +36,7 @@ the original Qwen decode baseline.
 | PyTorch SDPA for eight full-attention layers | 28.0 -> 27.9 tok/s (-0.4%); TTFT 217.9 -> 235.7 ms | DISCARD: short batch-1 attention does not amortize backend overhead |
 | Clear dynamic full-attention KV length on cache reset | repeated requests had retained zero-filled KV prefixes; reset now restores length zero | KEEP: fixes request isolation and benchmark repeatability |
 | Combine Qwen MLP gate/up projections | 27.7 -> 28.3 tok/s (+2.2%); TTFT 207.5 -> 186.1 ms (-10.3%); projection output exact | KEEP |
+| Combine four DeltaNet input projections | 27.4 -> 29.7 tok/s (+8.4%); same output SHA-256; VRAM unchanged | KEEP |
 
 ### Why the fused recurrence wins
 
@@ -78,3 +79,8 @@ dynamic layers to length zero while retaining fixed recurrent allocations.
 Qwen's MLP originally launched independent gate and up GEMVs over the same
 input. Concatenating those weights once after loading lets cuBLAS produce both
 projections in one wider GEMV with unchanged VRAM and exact output.
+
+Each DeltaNet layer similarly launched separate QKV, output-gate, beta, and
+decay projections. A unified weight produces all four channel ranges in one
+GEMV before splitting views, reducing 96 projection launches per token to 24
+without changing the generated output.

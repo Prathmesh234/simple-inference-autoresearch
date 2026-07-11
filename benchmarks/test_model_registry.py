@@ -6,11 +6,13 @@ import unittest
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from transformers import Qwen3_5TextConfig
 
 from model.registry import checkpoint_model_type, get_model_plugin
 from model.qwen35_plugin import (
     Qwen35DynamicCache,
+    Qwen35CombinedLinear,
     load_qwen35_config,
     qwen35_checkpoint_name,
 )
@@ -94,6 +96,17 @@ class ModelRegistryTest(unittest.TestCase):
         self.assertEqual(cache.get_seq_length(), 0)
         self.assertEqual(cache.layers[0].keys.numel(), 0)
         self.assertEqual(cache.layers[0].values.numel(), 0)
+
+    def test_combined_linear_preserves_projection_outputs(self):
+        torch.manual_seed(7)
+        first = nn.Linear(8, 5, bias=False)
+        second = nn.Linear(8, 3, bias=False)
+        hidden = torch.randn(2, 4, 8)
+        expected = torch.cat((first(hidden), second(hidden)), dim=-1)
+
+        actual = Qwen35CombinedLinear((first, second))(hidden)
+
+        self.assertTrue(torch.equal(actual, expected))
 
 
 if __name__ == "__main__":

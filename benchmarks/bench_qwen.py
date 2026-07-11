@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
 
@@ -77,6 +78,9 @@ def main() -> None:
                 "measured_runs": args.runs,
                 "prompt_tokens": prompt_tokens,
                 "new_tokens": samples[0]["new_tokens"],
+                "output_sha256": hashlib.sha256(
+                    outputs[0].encode()
+                ).hexdigest(),
                 "median": medians,
                 "samples": samples,
             },
