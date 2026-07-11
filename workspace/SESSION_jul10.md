@@ -27,6 +27,7 @@ full-attention layers. All 427 text tensors map exactly.
 | Reuse fused Triton SwiGLU in Qwen MLP | 26.6 -> 24.0 tok/s (-9.8%); identical 96-token greedy output | DISCARD: Triton tiled dispatch costs more than two eager batch-1 elementwise kernels |
 | Fused single-token causal depthwise-convolution state update | kernel 13.6 -> 8.6 us (1.58x); model 25.6 -> 27.4 tok/s (+7.0%); identical 96-token greedy output | KEEP |
 | Fused DeltaNet RMSNorm and SiLU gate | kernel 66.9 -> 4.4 us (15.35x); model 25.1 -> 28.2 tok/s (+12.4%); exact bf16 parity and identical 96-token greedy output | KEEP |
+| PyTorch SDPA for eight full-attention layers | 28.0 -> 27.9 tok/s (-0.4%); TTFT 217.9 -> 235.7 ms | DISCARD: short batch-1 attention does not amortize backend overhead |
 
 ### Why the fused recurrence wins
 
