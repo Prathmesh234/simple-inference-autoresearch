@@ -9,10 +9,16 @@ Branch: `autoresearch/jul10`
 | Llama-3.1-8B | full fixed profiler, best aggregate | 8,837.7 | mixed sweep | 30.30 GB |
 | Llama-3.1-8B | full fixed profiler, batch 1 | 85.3 | mixed sweep | 30.30 GB |
 | Qwen3.5-9B | warmed greedy, batch 1 | 20.9 | 223.2 | 17.96 GB |
+| Qwen3.5-9B | retained path, 3-run median | 26.9 | 208.2 | 17.97 GB |
 
 The Qwen baseline uses the official text backbone behind the engine's model
 plugin contract. Its checkpoint has 32 layers: 24 Gated DeltaNet and eight
 full-attention layers. All 427 text tensors map exactly.
+
+`benchmarks/bench_qwen.py` is the repeatable Qwen yardstick. It loads once,
+warms once, measures three 96-token greedy runs, reports medians, and fails if
+cache reuse changes generated output. The retained path is 28.7% faster than
+the original Qwen decode baseline.
 
 ## Experiments
 
@@ -25,7 +31,7 @@ full-attention layers. All 427 text tensors map exactly.
 | Static full-attention KV cache, sized to request maximum | 22.9 -> 23.0 tok/s (+0.4%); identical 96-token greedy output | DISCARD: fixed-length attention offsets avoided concatenation |
 | Fused Triton RMSNorm for Qwen hidden and strided Q/K norms | 23.5 -> 25.7 tok/s (+9.4%); standalone 3.5-8.6x; identical 96-token greedy output | KEEP |
 | Reuse fused Triton SwiGLU in Qwen MLP | 26.6 -> 24.0 tok/s (-9.8%); identical 96-token greedy output | DISCARD: Triton tiled dispatch costs more than two eager batch-1 elementwise kernels |
-| Fused single-token causal depthwise-convolution state update | kernel 13.6 -> 8.6 us (1.58x); model 25.6 -> 27.4 tok/s (+7.0%); identical 96-token greedy output | KEEP |
+| Fused single-token causal depthwise-convolution state update | initially 25.6 -> 27.4 tok/s (+7.0%), but six identical 48-token cache reuses produced two output hashes | DISCARD: integrated generation was nondeterministic |
 | Fused DeltaNet RMSNorm and SiLU gate | kernel 66.9 -> 4.4 us (15.35x); model 25.1 -> 28.2 tok/s (+12.4%); exact bf16 parity and identical 96-token greedy output | KEEP |
 | PyTorch SDPA for eight full-attention layers | 28.0 -> 27.9 tok/s (-0.4%); TTFT 217.9 -> 235.7 ms | DISCARD: short batch-1 attention does not amortize backend overhead |
 
@@ -50,11 +56,11 @@ compile-time weight offset and independent contiguous output addressing reduces
 each eager multi-kernel norm to one launch. The strided regression case is part
 of the RMSNorm benchmark gate.
 
-The DeltaNet convolution fallback concatenated old state and input, copied the
-new state, launched grouped Conv1d, sliced, and applied SiLU independently in
-all 24 recurrent layers. The decode-only kernel shifts each four-value state,
-computes the depthwise dot product, applies SiLU, and writes the token in one
-launch. Prefill continues to use the framework path.
+The attempted DeltaNet convolution kernel fused state shift, depthwise dot
+product, and SiLU. It was deterministic across 1,000 isolated resets and its
+state matched the reference exactly, but repeated full-model cache reuse
+eventually changed greedy output. The production path therefore remains on the
+framework convolution fallback until the integrated instability is resolved.
 
 The DeltaNet output gate previously used casts, square, mean, reciprocal root,
 normalization, weight scaling, SiLU, multiplication, and a final cast as eager
