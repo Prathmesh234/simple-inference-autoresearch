@@ -64,6 +64,7 @@ def _rmsnorm_fwd(
     stride_row,   # x_ptr stride between rows (== N for contiguous)
     N,            # hidden_size (4096)
     eps,
+    WEIGHT_OFFSET: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,   # next_power_of_2(N), e.g. 8192
 ):
     """
@@ -90,7 +91,7 @@ def _rmsnorm_fwd(
     row = x_ptr + pid*stride_row
     weight = w_ptr
     ##now we basically get the output too
-    output = out_ptr + pid*stride_row
+    output = out_ptr + pid*N
     #3let us get the cols too
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < N
@@ -101,7 +102,7 @@ def _rmsnorm_fwd(
     var = tl.sum(x*x, axis=0)/N
     rms = tl.rsqrt(var + eps)
     ##now we get the output
-    out = x*w*rms
+    out = x*(w + WEIGHT_OFFSET)*rms
     ##now we need to write the output
     tl.store(output + cols, out.to(x_ptr.dtype.element_ty), mask=mask)
 
@@ -112,6 +113,7 @@ def rmsnorm_triton(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-5,
+    weight_offset: float = 0.0,
 ) -> torch.Tensor:
     """
     Drop-in replacement for the PyTorch RMSNorm forward.
@@ -153,8 +155,8 @@ def rmsnorm_triton(
         x_stride,       # stride between rows
         N,              # hidden_size
         eps,
+        WEIGHT_OFFSET=weight_offset,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
     return out.reshape(orig_shape)
-

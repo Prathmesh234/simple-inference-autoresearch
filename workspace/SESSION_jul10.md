@@ -9,10 +9,16 @@ Branch: `autoresearch/jul10`
 | Llama-3.1-8B | full fixed profiler, best aggregate | 8,837.7 | mixed sweep | 30.30 GB |
 | Llama-3.1-8B | full fixed profiler, batch 1 | 85.3 | mixed sweep | 30.30 GB |
 | Qwen3.5-9B | warmed greedy, batch 1 | 20.9 | 223.2 | 17.96 GB |
+| Qwen3.5-9B | retained path, 5-run median | 29.7 | 197.1 | 17.96 GB |
 
 The Qwen baseline uses the official text backbone behind the engine's model
 plugin contract. Its checkpoint has 32 layers: 24 Gated DeltaNet and eight
 full-attention layers. All 427 text tensors map exactly.
+
+`benchmarks/bench_qwen.py` is the repeatable Qwen yardstick. It loads once,
+warms once, measures three 96-token greedy runs, reports medians, and fails if
+cache reuse changes generated output. The retained path is 42.1% faster than
+the original Qwen decode baseline.
 
 ## Experiments
 
@@ -23,6 +29,16 @@ full-attention layers. All 427 text tensors map exactly.
 | Fused Triton single-token Gated DeltaNet recurrence | kernel 147.3 -> 13.2 us (11.15x); warmed model 20.9 -> 24.1 tok/s (+15.3%) | KEEP |
 | Skip recurrent cache self-copy after in-place fused update | 23.2 -> 24.3 tok/s (+4.7%); identical 96-token greedy output | KEEP |
 | Static full-attention KV cache, sized to request maximum | 22.9 -> 23.0 tok/s (+0.4%); identical 96-token greedy output | DISCARD: fixed-length attention offsets avoided concatenation |
+| Fused Triton RMSNorm for Qwen hidden and strided Q/K norms | 23.5 -> 25.7 tok/s (+9.4%); standalone 3.5-8.6x; identical 96-token greedy output | KEEP |
+| Reuse fused Triton SwiGLU in Qwen MLP | 26.6 -> 24.0 tok/s (-9.8%); identical 96-token greedy output | DISCARD: Triton tiled dispatch costs more than two eager batch-1 elementwise kernels |
+| Fused single-token causal depthwise-convolution state update | corrected 5-run median 29.1 -> 28.5 tok/s (-2.1%); deterministic after cache fix | DISCARD: one Triton launch loses to optimized framework conv at the retained baseline |
+| Fused DeltaNet RMSNorm and SiLU gate | kernel 66.9 -> 4.4 us (15.35x); model 25.1 -> 28.2 tok/s (+12.4%); exact bf16 parity and identical 96-token greedy output | KEEP |
+| PyTorch SDPA for eight full-attention layers | 28.0 -> 27.9 tok/s (-0.4%); TTFT 217.9 -> 235.7 ms | DISCARD: short batch-1 attention does not amortize backend overhead |
+| Clear dynamic full-attention KV length on cache reset | repeated requests had retained zero-filled KV prefixes; reset now restores length zero | KEEP: fixes request isolation and benchmark repeatability |
+| Combine Qwen MLP gate/up projections | 27.7 -> 28.3 tok/s (+2.2%); TTFT 207.5 -> 186.1 ms (-10.3%); projection output exact | KEEP |
+| Combine four DeltaNet input projections | 27.4 -> 29.7 tok/s (+8.4%); same output SHA-256; VRAM unchanged | KEEP |
+| Combine Q/K/V projections in eight full-attention layers | 31.1 -> 29.2 tok/s (-6.1%); TTFT 188.1 -> 217.6 ms; output exact | DISCARD: wider shape selects a slower GEMV path |
+| Static-cache CUDA Graph replay for batch-1 decode | 29.5 -> 45.9 tok/s (+55.6%), but short-prompt greedy output diverged from eager | DISCARD: static-cache attention changed token selection |
 
 ### Why the fused recurrence wins
 
@@ -38,3 +54,41 @@ Transformers' generic cache path copied that tensor back onto itself after
 every linear-attention layer. Detecting the storage alias avoids 24 redundant
 state update calls per decoded token while preserving the original cache path
 for prefill and non-aliased updates.
+
+The Qwen RMSNorm path also stores scale as an offset from one and applies norms
+to strided Q/K projection views. Extending the shared Triton kernel with a
+compile-time weight offset and independent contiguous output addressing reduces
+each eager multi-kernel norm to one launch. The strided regression case is part
+of the RMSNorm benchmark gate.
+
+The attempted DeltaNet convolution kernel fused state shift, depthwise dot
+product, and SiLU. It was deterministic across 1,000 isolated resets and its
+state matched the reference exactly. Its original determinism result was
+confounded by a separate dynamic-cache reset bug, but the corrected retest was
+stable and slower. The production path therefore remains on the framework
+fallback.
+
+The DeltaNet output gate previously used casts, square, mean, reciprocal root,
+normalization, weight scaling, SiLU, multiplication, and a final cast as eager
+operations. The fused kernel preserves Qwen's norm-before-gate ordering and
+bf16 intermediate rounding while collapsing that sequence to one launch.
+
+Transformers' dynamic full-attention cache reset zeroed KV tensors without
+shrinking their sequence dimension. Reused requests therefore concatenated new
+keys after an ever-growing zero prefix. The Qwen cache adapter now restores
+dynamic layers to length zero while retaining fixed recurrent allocations.
+
+Qwen's MLP originally launched independent gate and up GEMVs over the same
+input. Concatenating those weights once after loading lets cuBLAS produce both
+projections in one wider GEMV with unchanged VRAM and exact output.
+
+Each DeltaNet layer similarly launched separate QKV, output-gate, beta, and
+decay projections. A unified weight produces all four channel ranges in one
+GEMV before splitting views, reducing 96 projection launches per token to 24
+without changing the generated output.
+
+CUDA Graph replay removed most Python launch overhead and added only 0.02 GB
+VRAM, but its static full-attention cache changed numerical reduction behavior.
+On a five-token prompt, eager generated "guesses or draw conclusions" while
+the graph path generated "guesses or deductions". Exact greedy parity is a
+retention gate, so the graph implementation was removed.

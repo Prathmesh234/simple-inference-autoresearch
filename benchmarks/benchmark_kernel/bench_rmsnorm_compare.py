@@ -68,6 +68,31 @@ def main():
           f"[{'PASS' if max_diff < 1e-1 else 'FAIL'}]")
     print(f"  mean |pytorch - triton| = {mean_diff:.2e}")
 
+    # Qwen3.5 stores RMSNorm weights as offsets from one. Its Q/K tensors are
+    # views into an interleaved projection, so their row stride exceeds width.
+    qwen_h = 256
+    qwen_storage = torch.randn(
+        7, qwen_h * 2, device=DEVICE, dtype=DTYPE
+    )
+    qwen_x = qwen_storage[:, :qwen_h]
+    qwen_w = torch.randn(qwen_h, device=DEVICE, dtype=DTYPE)
+    qwen_var = qwen_x.float().pow(2).mean(-1, keepdim=True)
+    qwen_ref = (
+        qwen_x.float()
+        * torch.rsqrt(qwen_var + 1e-6)
+        * (1.0 + qwen_w.float())
+    ).to(DTYPE)
+    qwen_got = rmsnorm_triton(
+        qwen_x, qwen_w, 1e-6, weight_offset=1.0
+    )
+    qwen_diff = (qwen_ref - qwen_got).abs().max().item()
+    print(
+        f"  max strided Qwen offset diff = {qwen_diff:.2e}   "
+        f"[{'PASS' if qwen_diff < 1e-1 else 'FAIL'}]"
+    )
+    if qwen_diff >= 1e-1:
+        raise AssertionError(f"Qwen RMSNorm max error {qwen_diff}")
+
     # ── Latency ───────────────────────────────────────────────────────────
     print(f"\n--- Latency / Bandwidth (peak {PEAK_BW:.0f} GB/s) ---")
     print(f"  {'Config':<18} {'PyTorch':>12} {'Triton':>12} {'Speedup':>10} "
